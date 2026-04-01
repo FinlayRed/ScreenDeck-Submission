@@ -1,0 +1,41 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run dev",
+    "devPath": "http://localhost:1420",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Deck Macro Editor",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false
+    },
+    "systemTray": {
+      "iconPath": "icons/icon.ico"
+    },
+    "bundle": {
+      "active": false,
+      "identifier": "com.finlay.deckmacroeditor",
+      "icon": [
+        "icons/icon.ico"
+      ]
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "Deck Macro Editor",
+        "width": 1360,
+        "height": 900,
+        "minWidth": 1000,
+        "minHeight": 740,
+        "resizable": true
+      }
+    ]
+  }
+}
