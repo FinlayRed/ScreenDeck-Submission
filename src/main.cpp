@@ -29,6 +29,9 @@
 #define BUTTON_SIZE 85  // Size of each button
 #define BUTTON_GAP 17   // Gap between buttons
 #define TOTAL_BUTTONS (GRID_ROWS * GRID_COLS)
+#define BUTTON_TAP_ZOOM 272
+#define BUTTON_TAP_PRESS_MS 70
+#define BUTTON_TAP_RELEASE_MS 140
 
 // Macro configuration
 #define MACRO_CONFIG_PATH "/macros.json"
@@ -243,6 +246,10 @@ IconMacro g_iconMacros[TOTAL_BUTTONS];
 MacroExecutorState g_macroExecutor;
 CdcUploadSession g_cdcUpload;
 
+static lv_style_t g_buttonTapStyleDefault;
+static lv_style_t g_buttonTapStylePressed;
+static bool g_buttonTapStylesInitialized = false;
+
 char g_serialLineBuffer[160] = {0};
 size_t g_serialLineLength = 0;
 #if HAS_USB_CDC_CLASS
@@ -253,6 +260,35 @@ size_t g_usbLineLength = 0;
 constexpr uint16_t kComboHoldMs = 12;
 constexpr uint16_t kComboGapMs = 8;
 constexpr unsigned long kCdcUploadTimeoutMs = 30000;
+
+static void ensureButtonTapStyles() {
+  if (g_buttonTapStylesInitialized) {
+    return;
+  }
+
+  static const lv_style_prop_t transitionProps[] = {LV_STYLE_TRANSFORM_ZOOM,
+                                                    LV_STYLE_PROP_INV};
+  static lv_style_transition_dsc_t releaseTransition;
+  static lv_style_transition_dsc_t pressTransition;
+
+  lv_style_transition_dsc_init(&releaseTransition, transitionProps,
+                               lv_anim_path_overshoot,
+                               BUTTON_TAP_RELEASE_MS, 0, nullptr);
+  lv_style_transition_dsc_init(&pressTransition, transitionProps,
+                               lv_anim_path_ease_out,
+                               BUTTON_TAP_PRESS_MS, 0, nullptr);
+
+  lv_style_init(&g_buttonTapStyleDefault);
+  lv_style_set_transform_pivot_x(&g_buttonTapStyleDefault, BUTTON_SIZE / 2);
+  lv_style_set_transform_pivot_y(&g_buttonTapStyleDefault, BUTTON_SIZE / 2);
+  lv_style_set_transition(&g_buttonTapStyleDefault, &releaseTransition);
+
+  lv_style_init(&g_buttonTapStylePressed);
+  lv_style_set_transform_zoom(&g_buttonTapStylePressed, BUTTON_TAP_ZOOM);
+  lv_style_set_transition(&g_buttonTapStylePressed, &pressTransition);
+
+  g_buttonTapStylesInitialized = true;
+}
 
 static Stream* streamForPortId(CdcPortId portId) {
   if (portId == CdcPortId::SerialPort) {
@@ -1408,6 +1444,7 @@ lv_obj_t* create_icon_image(const char* path) {
 
 void rebuildGridUI() {
   lvgl_port_lock(-1);
+  ensureButtonTapStyles();
 
   lv_obj_t* screen = lv_scr_act();
   lv_obj_clean(screen);
@@ -1437,6 +1474,8 @@ void rebuildGridUI() {
       lv_obj_set_size(btn, BUTTON_SIZE, BUTTON_SIZE);
       lv_obj_set_pos(btn, start_x + col * (BUTTON_SIZE + BUTTON_GAP),
                      start_y + row * (BUTTON_SIZE + BUTTON_GAP));
+      lv_obj_add_style(btn, &g_buttonTapStyleDefault, 0);
+      lv_obj_add_style(btn, &g_buttonTapStylePressed, LV_STATE_PRESSED);
 
       uint32_t position = (row << 16) | col;
       lv_obj_set_user_data(btn, (void*)position);
