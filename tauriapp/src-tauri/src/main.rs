@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use serialport::{ClearBuffer, SerialPort};
+use serialport::{ClearBuffer, SerialPort, SerialPortInfo, SerialPortType};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -23,8 +23,8 @@ const MAX_UPLOAD_BYTES: usize = 1024 * 1024;
 const HANDSHAKE_TOTAL_TIMEOUT_MS: u64 = 20000;
 const PROBE_HANDSHAKE_TIMEOUT_MS: u64 = 8000;
 const PORT_SETTLE_MS: u64 = 1000;
-const UPLOAD_CHUNK_SIZE: usize = 128;
-const UPLOAD_INTER_CHUNK_DELAY_MS: u64 = 1;
+const UPLOAD_CHUNK_SIZE: usize = 32;
+const UPLOAD_INTER_CHUNK_DELAY_MS: u64 = 4;
 const UPLOAD_IO_TIMEOUT_MS: u64 = 1200;
 const UPLOAD_WRITE_RETRY_COUNT: usize = 6;
 const UPLOAD_RETRY_SLEEP_MS: u64 = 8;
@@ -40,7 +40,8 @@ const COMPANION_LOG_EVENT: &str = "companion-log";
 const DEVICE_BUTTON_EVENT: &str = "device-button-event";
 const LISTENER_RECONNECT_DELAY_MS: u64 = 1200;
 const LISTENER_IDLE_SLEEP_MS: u64 = 300;
-const LISTENER_PAUSE_WAIT_MS: u64 = 4000;
+const LISTENER_PAUSE_WAIT_MS: u64 = 8000;
+const LISTENER_HANDSHAKE_TIMEOUT_MS: u64 = 500;
 const COMPANION_SETTINGS_FILE: &str = "companion-settings.json";
 const COMPANION_MACROS_FILE: &str = "companion-macros.json";
 
@@ -193,7 +194,11 @@ struct CompanionStatus {
 }
 
 impl CompanionStatus {
-    fn from_settings(settings: &CompanionSettings, host_action_count: usize, autostart_enabled: bool) -> Self {
+    fn from_settings(
+        settings: &CompanionSettings,
+        host_action_count: usize,
+        autostart_enabled: bool,
+    ) -> Self {
         Self {
             port_name: settings.port_name.clone(),
             baud_rate: settings.baud_rate,
@@ -245,7 +250,8 @@ impl CompanionState {
         let settings = load_companion_settings(&settings_path).unwrap_or_default();
         let host_actions = load_host_actions_cache(&macros_path).unwrap_or_default();
         let host_action_count = host_actions.values().map(Vec::len).sum();
-        let status = CompanionStatus::from_settings(&settings, host_action_count, autostart_enabled);
+        let status =
+            CompanionStatus::from_settings(&settings, host_action_count, autostart_enabled);
 
         Self {
             shared: Arc::new(Mutex::new(CompanionShared {
@@ -324,14 +330,12 @@ fn parse_host_actions_document(text: &str) -> Result<HashMap<u8, Vec<HostCommand
     let mut actions_by_icon: HashMap<u8, Vec<HostCommandAction>> = HashMap::new();
 
     for icon in document.icons {
-        let index = icon
-            .index
-            .or_else(|| match (icon.row, icon.col) {
-                (Some(row), Some(col)) if row < GRID_ROWS && col < GRID_COLS => {
-                    Some(row * GRID_COLS + col)
-                }
-                _ => None,
-            });
+        let index = icon.index.or_else(|| match (icon.row, icon.col) {
+            (Some(row), Some(col)) if row < GRID_ROWS && col < GRID_COLS => {
+                Some(row * GRID_COLS + col)
+            }
+            _ => None,
+        });
 
         let Some(index) = index else {
             continue;
@@ -356,7 +360,10 @@ fn load_host_actions_cache(path: &PathBuf) -> Option<HashMap<u8, Vec<HostCommand
     parse_host_actions_document(&text).ok()
 }
 
-fn update_host_actions_cache(companion: &CompanionState, macros_json: &str) -> Result<usize, String> {
+fn update_host_actions_cache(
+    companion: &CompanionState,
+    macros_json: &str,
+) -> Result<usize, String> {
     let actions = parse_host_actions_document(macros_json)?;
     let action_count = actions.values().map(Vec::len).sum();
 
@@ -378,17 +385,11 @@ fn emit_companion_status(app_handle: &AppHandle, companion: &CompanionState) {
 }
 
 fn emit_companion_log(app_handle: &AppHandle, line: impl Into<String>) {
-    let _ = app_handle.emit_all(
-        COMPANION_LOG_EVENT,
-        CompanionLogEvent { line: line.into() },
-    );
+    let _ = app_handle.emit_all(COMPANION_LOG_EVENT, CompanionLogEvent { line: line.into() });
 }
 
-fn update_companion_status<F>(
-    app_handle: &AppHandle,
-    companion: &CompanionState,
-    update: F,
-) where
+fn update_companion_status<F>(app_handle: &AppHandle, companion: &CompanionState, update: F)
+where
     F: FnOnce(&mut CompanionStatus),
 {
     {
@@ -422,7 +423,6 @@ fn pause_companion_listener(
         }
 
         if Instant::now() >= deadline {
-            set_companion_paused(companion, false);
             emit_companion_status(app_handle, companion);
             return Err("Timed out waiting for companion listener to pause".to_string());
         }
@@ -484,7 +484,10 @@ fn parse_button_event(line: &str) -> Option<DeviceButtonEvent> {
     Some(DeviceButtonEvent { index, row, col })
 }
 
-fn read_listener_line(port: &mut dyn SerialPort, buffer: &mut Vec<u8>) -> Result<Option<String>, String> {
+fn read_listener_line(
+    port: &mut dyn SerialPort,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<String>, String> {
     let mut byte = [0_u8; 1];
 
     match port.read(&mut byte) {
@@ -564,7 +567,9 @@ fn execute_host_actions(
         }
 
         let result = if action.run_detached {
-            command.spawn().map(|_| "Started detached process".to_string())
+            command
+                .spawn()
+                .map(|_| "Started detached process".to_string())
         } else {
             command.output().map(|output| {
                 if output.status.success() {
@@ -606,15 +611,15 @@ fn execute_host_actions(
     }
 }
 
-fn handle_listener_line(
-    app_handle: &AppHandle,
-    companion: &CompanionState,
-    line: &str,
-) {
+fn handle_listener_line(app_handle: &AppHandle, companion: &CompanionState, line: &str) {
     if let Some(event) = parse_button_event(line) {
         let actions = {
             let shared = companion.shared.lock().unwrap();
-            shared.host_actions.get(&event.index).cloned().unwrap_or_default()
+            shared
+                .host_actions
+                .get(&event.index)
+                .cloned()
+                .unwrap_or_default()
         };
 
         update_companion_status(app_handle, companion, |status| {
@@ -624,7 +629,9 @@ fn handle_listener_line(
 
         let app_handle_clone = app_handle.clone();
         let companion_clone = companion.clone();
-        thread::spawn(move || execute_host_actions(app_handle_clone, companion_clone, event, actions));
+        thread::spawn(move || {
+            execute_host_actions(app_handle_clone, companion_clone, event, actions)
+        });
         return;
     }
 
@@ -672,6 +679,16 @@ fn companion_listener_loop(app_handle: AppHandle, companion: CompanionState) {
             }
         };
 
+        let (latest_settings, paused, shutdown) = companion_settings_snapshot(&companion);
+        if shutdown
+            || paused
+            || latest_settings.port_name != settings.port_name
+            || latest_settings.baud_rate != settings.baud_rate
+            || latest_settings.listener_enabled != settings.listener_enabled
+        {
+            continue;
+        }
+
         {
             let mut shared = companion.shared.lock().unwrap();
             shared.port_open = true;
@@ -679,7 +696,7 @@ fn companion_listener_loop(app_handle: AppHandle, companion: CompanionState) {
 
         let mut handshake_logs = Vec::new();
         if let Err(err) = drain_pending_lines(port.as_mut(), &mut handshake_logs)
-            .and_then(|_| handshake_with_fallback(port.as_mut(), &mut handshake_logs, HANDSHAKE_TOTAL_TIMEOUT_MS))
+            .and_then(|_| listener_handshake(port.as_mut(), &mut handshake_logs))
         {
             {
                 let mut shared = companion.shared.lock().unwrap();
@@ -798,10 +815,52 @@ fn open_serial_port(port_name: &str, baud_rate: u32) -> Result<Box<dyn SerialPor
         .map_err(|e| format!("Failed to open {}: {e}", port_name))?;
 
     let _ = port.write_data_terminal_ready(true);
-    let _ = port.write_request_to_send(true);
+    let _ = port.write_request_to_send(false);
     thread::sleep(Duration::from_millis(PORT_SETTLE_MS));
     let _ = port.clear(ClearBuffer::Input);
     Ok(port)
+}
+
+fn contains_case_insensitive(value: &str, needle: &str) -> bool {
+    value
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+fn serial_port_preference_score(info: &SerialPortInfo) -> i32 {
+    match &info.port_type {
+        SerialPortType::UsbPort(usb) => {
+            let mut score = 10;
+
+            if usb.vid == 0x303a {
+                score += 30;
+            }
+
+            if usb.product.as_deref().map_or(false, |product| {
+                contains_case_insensitive(product, "Finlay Deck")
+            }) {
+                score += 100;
+            }
+
+            if usb.manufacturer.as_deref().map_or(false, |manufacturer| {
+                contains_case_insensitive(manufacturer, "Finlay")
+                    || contains_case_insensitive(manufacturer, "Espressif")
+            }) {
+                score += 20;
+            }
+
+            if usb
+                .product
+                .as_deref()
+                .map_or(false, |product| contains_case_insensitive(product, "ESP32"))
+            {
+                score += 15;
+            }
+
+            score
+        }
+        _ => 0,
+    }
 }
 
 fn read_line_until(port: &mut dyn SerialPort, deadline: Instant) -> Result<String, String> {
@@ -878,8 +937,24 @@ fn handshake_with_fallback(
     total_timeout_ms: u64,
 ) -> Result<(), String> {
     let attempts: [(&str, u64); 3] = [("PING", total_timeout_ms), ("STATUS", 2000), ("PING", 2000)];
+    handshake_with_attempts(port, logs, &attempts)
+}
 
-    for (command, timeout_ms) in attempts {
+fn listener_handshake(port: &mut dyn SerialPort, logs: &mut Vec<String>) -> Result<(), String> {
+    let attempts: [(&str, u64); 3] = [
+        ("PING", LISTENER_HANDSHAKE_TIMEOUT_MS),
+        ("STATUS", LISTENER_HANDSHAKE_TIMEOUT_MS),
+        ("PING", LISTENER_HANDSHAKE_TIMEOUT_MS),
+    ];
+    handshake_with_attempts(port, logs, &attempts)
+}
+
+fn handshake_with_attempts(
+    port: &mut dyn SerialPort,
+    logs: &mut Vec<String>,
+    attempts: &[(&str, u64)],
+) -> Result<(), String> {
+    for &(command, timeout_ms) in attempts {
         send_line(port, command, logs)?;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -931,7 +1006,19 @@ fn probe_serial_ports_impl(baud_rate: u32) -> Result<ProbePortsResult, String> {
     let mut logs: Vec<String> = Vec::new();
     let mut ports: Vec<ProbePortResult> = Vec::new();
 
-    for info in port_infos {
+    let mut scored_ports: Vec<(i32, SerialPortInfo)> = port_infos
+        .into_iter()
+        .map(|info| (serial_port_preference_score(&info), info))
+        .collect();
+    scored_ports.sort_by(|(left_score, left_info), (right_score, right_info)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_info.port_name.cmp(&right_info.port_name))
+    });
+
+    let mut best_responsive: Option<(i32, String)> = None;
+
+    for (score, info) in scored_ports {
         let name = info.port_name;
         logs.push(format!("Probing {name}"));
 
@@ -948,6 +1035,13 @@ fn probe_serial_ports_impl(baud_rate: u32) -> Result<ProbePortsResult, String> {
                     PROBE_HANDSHAKE_TIMEOUT_MS,
                 ) {
                     Ok(()) => {
+                        if match best_responsive.as_ref() {
+                            Some((best_score, _)) => score > *best_score,
+                            None => true,
+                        } {
+                            best_responsive = Some((score, name.clone()));
+                        }
+
                         ports.push(ProbePortResult {
                             port_name: name,
                             responsive: true,
@@ -975,11 +1069,7 @@ fn probe_serial_ports_impl(baud_rate: u32) -> Result<ProbePortsResult, String> {
         logs.extend(probe_logs);
     }
 
-    let suggested_port = ports
-        .iter()
-        .find(|p| p.responsive)
-        .map(|p| p.port_name.clone())
-        .or_else(|| ports.first().map(|p| p.port_name.clone()));
+    let suggested_port = best_responsive.map(|(_, port_name)| port_name);
 
     Ok(ProbePortsResult {
         ports,
@@ -999,8 +1089,8 @@ async fn probe_serial_ports(
         let _pause = pause_companion_listener(&app_handle, &companion)?;
         probe_serial_ports_impl(baud_rate)
     })
-        .await
-        .map_err(|e| format!("Background task failed: {e}"))?
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
 }
 
 fn upload_file(
@@ -1151,6 +1241,7 @@ fn stream_payload_chunked(
         }
 
         sent = chunk_end;
+        flush_serial_port(port)?;
         if UPLOAD_INTER_CHUNK_DELAY_MS > 0 && sent < total {
             thread::sleep(Duration::from_millis(UPLOAD_INTER_CHUNK_DELAY_MS));
         }
@@ -1164,6 +1255,10 @@ fn stream_payload_chunked(
         }
     }
 
+    flush_serial_port(port)
+}
+
+fn flush_serial_port(port: &mut dyn SerialPort) -> Result<(), String> {
     for attempt in 0..=UPLOAD_WRITE_RETRY_COUNT {
         match port.flush() {
             Ok(()) => return Ok(()),
@@ -1306,7 +1401,10 @@ fn download_file(
     Ok(Some(payload))
 }
 
-fn send_updates_impl(app_handle: AppHandle, request: SendUpdatesRequest) -> Result<SendUpdatesResult, String> {
+fn send_updates_impl(
+    app_handle: AppHandle,
+    request: SendUpdatesRequest,
+) -> Result<SendUpdatesResult, String> {
     if request.port_name.trim().is_empty() {
         return Err("A serial port must be selected".to_string());
     }
@@ -1491,8 +1589,8 @@ async fn send_updates(
         let _pause = pause_companion_listener(&app_handle_for_task, &companion)?;
         send_updates_impl(app_handle_for_task, request)
     })
-        .await
-        .map_err(|e| format!("Background task failed: {e}"))??;
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))??;
 
     if let Some(macros_json) = macros_for_cache.as_ref() {
         let companion = state.inner().clone();
@@ -1624,8 +1722,8 @@ async fn sync_from_device(
         let _pause = pause_companion_listener(&app_handle_for_task, &companion)?;
         sync_from_device_impl(request)
     })
-        .await
-        .map_err(|e| format!("Background task failed: {e}"))??;
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))??;
 
     let companion = state.inner().clone();
     update_host_actions_cache(&companion, &result.macros_json)?;
@@ -1641,7 +1739,8 @@ fn companion_storage_dir(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| "Failed to resolve companion data directory".to_string())?;
 
-    fs::create_dir_all(&path).map_err(|e| format!("Failed to create companion data directory: {e}"))?;
+    fs::create_dir_all(&path)
+        .map_err(|e| format!("Failed to create companion data directory: {e}"))?;
     Ok(path)
 }
 

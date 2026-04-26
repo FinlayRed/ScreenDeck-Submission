@@ -1366,8 +1366,8 @@ async function refreshPorts(): Promise<void> {
 
     if (result.suggestedPort) {
       state.selectedPort = result.suggestedPort;
-    } else if (!state.ports.includes(state.selectedPort)) {
-      state.selectedPort = state.ports[0] ?? "";
+    } else if (!state.ports.includes(state.selectedPort) || !isPortResponsive(state.selectedPort)) {
+      state.selectedPort = "";
     }
 
     await syncCompanionSettings();
@@ -1379,6 +1379,7 @@ async function refreshPorts(): Promise<void> {
     }
 
     if (responsiveCount === 0) {
+      appendLog("No responsive CDC device detected. Reconnect the ESP32 and refresh ports.");
       for (const line of result.logs) {
         appendLog(line);
       }
@@ -1423,7 +1424,10 @@ async function sendChanges(): Promise<void> {
     }
 
     if (!isPortResponsive(state.selectedPort)) {
-      appendLog("Proceeding anyway: selected port did not confirm during probe.");
+      state.error = `Selected port ${state.selectedPort} did not respond to the CDC protocol.`;
+      appendLog(state.error);
+      render();
+      return;
     }
   }
 
@@ -1549,7 +1553,10 @@ async function syncFromDevice(): Promise<void> {
     }
 
     if (!isPortResponsive(state.selectedPort)) {
-      appendLog("Proceeding anyway: selected port did not confirm during probe.");
+      state.error = `Selected port ${state.selectedPort} did not respond to the CDC protocol.`;
+      appendLog(state.error);
+      render();
+      return;
     }
   }
 

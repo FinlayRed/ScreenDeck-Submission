@@ -172,7 +172,7 @@
 #endif
 
 // Screensaver configuration
-#define SCREENSAVER_TIMEOUT_MS 60000      // 1 minute
+#define SCREENSAVER_TIMEOUT_MS 600000      // 1 minute
 #define SCREENSAVER_CHECK_INTERVAL_MS 1000
 
 // Forward declarations (used before definitions)
@@ -926,15 +926,17 @@ static void finishCdcUpload() {
 
   CdcPortId sourcePort = activeUploadPortId();
 
+  if (strcmp(g_cdcUpload.targetPath, MACRO_CONFIG_PATH) == 0) {
+    loadMacroConfigFromSD();
+  }
+
   cdcReplyToPort(sourcePort, "CDC:OK PUT %s %u", g_cdcUpload.targetPath,
                  static_cast<unsigned int>(g_cdcUpload.receivedBytes));
 
   if (strcmp(g_cdcUpload.targetPath, MACRO_CONFIG_PATH) == 0) {
     cdcReplyToPort(sourcePort, "CDC:INFO RELOAD MACROS");
-    loadMacroConfigFromSD();
   } else if (isIconAssetPath(g_cdcUpload.targetPath)) {
-    cdcReplyToPort(sourcePort, "CDC:INFO RELOAD ICONS");
-    rebuildGridUI();
+    cdcReplyToPort(sourcePort, "CDC:INFO ICON STORED");
   }
 
   resetCdcUploadState();
@@ -1222,7 +1224,11 @@ static void processCdcInputForPort(CdcPortId portId, Stream* inputStream,
 void processCdcInput() {
   if (g_cdcUpload.active &&
       (millis() - g_cdcUpload.lastDataMs > kCdcUploadTimeoutMs)) {
-    abortCdcUpload("TIMEOUT");
+    char reason[48];
+    snprintf(reason, sizeof(reason), "TIMEOUT %u/%u",
+             static_cast<unsigned int>(g_cdcUpload.receivedBytes),
+             static_cast<unsigned int>(g_cdcUpload.expectedBytes));
+    abortCdcUpload(reason);
   }
 
   processCdcInputForPort(CdcPortId::SerialPort, &Serial, g_serialLineBuffer,

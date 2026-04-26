@@ -125,10 +125,10 @@ After receiving exactly `size` bytes:
 CDC:OK PUT /macros.json 1234
 ```
 
-Then firmware auto-applies:
+Then firmware applies updates:
 
-- `/macros.json` -> `CDC:INFO RELOAD MACROS`
-- icon/fallback asset -> `CDC:INFO RELOAD ICONS`
+- `/macros.json` -> reloads macro config and emits `CDC:INFO RELOAD MACROS`
+- icon/fallback asset -> stores the file and emits `CDC:INFO ICON STORED`; send `RELOAD ICONS` or `RELOAD ALL` to rebuild the grid
 
 ## 4.6 `GET <path>`
 
@@ -173,7 +173,7 @@ CDC:ERR PATH_NOT_ALLOWED
 ## 6) Size and timeout limits
 
 - Upload size range: `1..1048576` bytes (`1 MB`).
-- Upload idle timeout: `5000 ms`.
+- Upload idle timeout: `30000 ms`.
 - Command line buffer length: 159 chars usable (160 with null terminator).
 
 Errors:

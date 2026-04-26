@@ -35,9 +35,9 @@ Download flow:
 If a file is missing, firmware returns:
 - `CDC:ERR GET NOT_FOUND`
 
-The firmware auto-applies updates:
+The firmware applies updates like this:
 - `/macros.json` upload -> reloads macro config
-- icon or fallback upload -> rebuilds the full icon grid
+- icon or fallback upload -> stores the file; send `RELOAD ICONS` or `RELOAD ALL` to rebuild the grid
 
 Quick test script:
 
@@ -45,8 +45,8 @@ Quick test script:
 pip install pyserial
 python tools/cdc_transfer_test.py --port COM5 --ping --status
 python tools/cdc_transfer_test.py --port COM5 --put macros.json /macros.json
-python tools/cdc_transfer_test.py --port COM5 --put icon_0_0.bin /icon_0_0.bin
-python tools/cdc_transfer_test.py --port COM5 --put icon_0_0.bin /icon_0_0.bin --chunk-size 128 --retry 3 --inter-chunk-ms 1.0
+python tools/cdc_transfer_test.py --port COM5 --put icon_0_0.bin /icon_0_0.bin --reload ICONS
+python tools/cdc_transfer_test.py --port COM5 --put icon_0_0.bin /icon_0_0.bin --chunk-size 128 --retry 3 --inter-chunk-ms 1.0 --reload ICONS
 python tools/cdc_transfer_test.py --port COM5 --get /macros.json downloaded_macros.json
 python tools/cdc_transfer_test.py --port COM5 --get /icon_0_0.bin icon_0_0_from_device.bin
 
