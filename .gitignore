@@ -6,3 +6,4 @@
 tauriapp/node_modules/
 tauriapp/dist/
 tauriapp/src-tauri/target/
+node_modules

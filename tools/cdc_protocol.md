@@ -19,6 +19,27 @@ Allowed upload paths:
 - `/macros.json`
 - `/fallback.bin`
 - `/icon_<row>_<col>.bin` where row is `0..3` and col is `0..7`
+- `/radial_<row>_<col>_<direction>.bin` where direction is `n`, `ne`, `e`, `se`, `s`, `sw`, `w`, or `nw`
+
+Macro config:
+- `macros.json` version `2` adds optional per-icon radial menus.
+- Version `1` files are still accepted.
+- A radial item can contain normal `actions` and optional desktop `hostActions`.
+
+```json
+{
+  "radial": {
+    "enabled": true,
+    "items": [
+      { "direction": "n", "actions": [{ "type": "combo", "key": "A", "mods": [] }], "hostActions": [] }
+    ]
+  }
+}
+```
+
+Events:
+- Main icon press: `CDC:EVENT BUTTON <index> <row> <col>`
+- Radial release: `CDC:EVENT RADIAL <index> <row> <col> <direction>`
 
 Upload flow:
 1. Send `PUT /macros.json 1234\n`
@@ -46,6 +67,7 @@ pip install pyserial
 python tools/cdc_transfer_test.py --port COM5 --ping --status
 python tools/cdc_transfer_test.py --port COM5 --put macros.json /macros.json
 python tools/cdc_transfer_test.py --port COM5 --put icon_0_0.bin /icon_0_0.bin --reload ICONS
+python tools/cdc_transfer_test.py --port COM5 --put radial_0_0_n.bin /radial_0_0_n.bin --reload ICONS
 python tools/cdc_transfer_test.py --port COM5 --put icon_0_0.bin /icon_0_0.bin --chunk-size 128 --retry 3 --inter-chunk-ms 1.0 --reload ICONS
 python tools/cdc_transfer_test.py --port COM5 --get /macros.json downloaded_macros.json
 python tools/cdc_transfer_test.py --port COM5 --get /icon_0_0.bin icon_0_0_from_device.bin

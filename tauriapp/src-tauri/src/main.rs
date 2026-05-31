@@ -44,6 +44,7 @@ const LISTENER_PAUSE_WAIT_MS: u64 = 8000;
 const LISTENER_HANDSHAKE_TIMEOUT_MS: u64 = 500;
 const COMPANION_SETTINGS_FILE: &str = "companion-settings.json";
 const COMPANION_MACROS_FILE: &str = "companion-macros.json";
+const RADIAL_DIRECTIONS: [&str; 8] = ["n", "ne", "e", "se", "s", "sw", "w", "nw"];
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +68,7 @@ struct IconUpload {
     index: u8,
     row: u8,
     col: u8,
+    direction: Option<String>,
     bytes: Vec<u8>,
 }
 
@@ -151,6 +153,24 @@ struct HostMacroIconEntry {
     col: Option<u8>,
     #[serde(default)]
     host_actions: Vec<HostCommandAction>,
+    radial: Option<HostMacroRadial>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct HostMacroRadial {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    items: Vec<HostMacroRadialItem>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct HostMacroRadialItem {
+    direction: Option<String>,
+    #[serde(default)]
+    host_actions: Vec<HostCommandAction>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -227,12 +247,13 @@ struct DeviceButtonEvent {
     index: u8,
     row: u8,
     col: u8,
+    direction: Option<String>,
 }
 
 struct CompanionShared {
     settings: CompanionSettings,
     status: CompanionStatus,
-    host_actions: HashMap<u8, Vec<HostCommandAction>>,
+    host_actions: HashMap<String, Vec<HostCommandAction>>,
     paused: bool,
     port_open: bool,
     shutdown: bool,
@@ -296,6 +317,7 @@ struct SyncFromDeviceRequest {
 struct IconDownload {
     row: u8,
     col: u8,
+    direction: Option<String>,
     bytes: Vec<u8>,
 }
 
@@ -324,10 +346,33 @@ fn save_companion_settings(companion: &CompanionState) -> Result<(), String> {
     fs::write(&path, text).map_err(|e| format!("Failed to write companion settings: {e}"))
 }
 
-fn parse_host_actions_document(text: &str) -> Result<HashMap<u8, Vec<HostCommandAction>>, String> {
+fn is_valid_radial_direction(direction: &str) -> bool {
+    RADIAL_DIRECTIONS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(direction))
+}
+
+fn normalized_radial_direction(direction: &str) -> Option<String> {
+    let trimmed = direction.trim().to_ascii_lowercase();
+    if is_valid_radial_direction(&trimmed) {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+fn button_action_key(index: u8) -> String {
+    format!("button:{index}")
+}
+
+fn radial_action_key(index: u8, direction: &str) -> String {
+    format!("radial:{index}:{direction}")
+}
+
+fn parse_host_actions_document(text: &str) -> Result<HashMap<String, Vec<HostCommandAction>>, String> {
     let document: HostMacroDocument =
         serde_json::from_str(text).map_err(|e| format!("Failed to parse macros.json: {e}"))?;
-    let mut actions_by_icon: HashMap<u8, Vec<HostCommandAction>> = HashMap::new();
+    let mut actions_by_key: HashMap<String, Vec<HostCommandAction>> = HashMap::new();
 
     for icon in document.icons {
         let index = icon.index.or_else(|| match (icon.row, icon.col) {
@@ -348,16 +393,80 @@ fn parse_host_actions_document(text: &str) -> Result<HashMap<u8, Vec<HostCommand
             .collect();
 
         if !filtered.is_empty() {
-            actions_by_icon.insert(index, filtered);
+            actions_by_key.insert(button_action_key(index), filtered);
+        }
+
+        if let Some(radial) = icon.radial.filter(|radial| radial.enabled) {
+            for item in radial.items {
+                let Some(direction) = item
+                    .direction
+                    .as_deref()
+                    .and_then(normalized_radial_direction)
+                else {
+                    continue;
+                };
+
+                let filtered: Vec<HostCommandAction> = item
+                    .host_actions
+                    .into_iter()
+                    .filter(|action| !action.program.trim().is_empty())
+                    .collect();
+
+                if !filtered.is_empty() {
+                    actions_by_key.insert(radial_action_key(index, &direction), filtered);
+                }
+            }
         }
     }
 
-    Ok(actions_by_icon)
+    Ok(actions_by_key)
 }
 
-fn load_host_actions_cache(path: &PathBuf) -> Option<HashMap<u8, Vec<HostCommandAction>>> {
+fn load_host_actions_cache(path: &PathBuf) -> Option<HashMap<String, Vec<HostCommandAction>>> {
     let text = fs::read_to_string(path).ok()?;
     parse_host_actions_document(&text).ok()
+}
+
+fn collect_radial_icon_downloads(text: &str) -> Vec<(u8, u8, String)> {
+    let Ok(document) = serde_json::from_str::<HostMacroDocument>(text) else {
+        return Vec::new();
+    };
+
+    let mut result = Vec::new();
+    for icon in document.icons {
+        let index = icon.index.or_else(|| match (icon.row, icon.col) {
+            (Some(row), Some(col)) if row < GRID_ROWS && col < GRID_COLS => {
+                Some(row * GRID_COLS + col)
+            }
+            _ => None,
+        });
+
+        let Some(index) = index else {
+            continue;
+        };
+
+        let row = icon.row.unwrap_or(index / GRID_COLS);
+        let col = icon.col.unwrap_or(index % GRID_COLS);
+        if row >= GRID_ROWS || col >= GRID_COLS {
+            continue;
+        }
+
+        let Some(radial) = icon.radial.filter(|radial| radial.enabled) else {
+            continue;
+        };
+
+        for item in radial.items {
+            if let Some(direction) = item
+                .direction
+                .as_deref()
+                .and_then(normalized_radial_direction)
+            {
+                result.push((row, col, direction));
+            }
+        }
+    }
+
+    result
 }
 
 fn update_host_actions_cache(
@@ -473,15 +582,31 @@ fn set_companion_last_error(app_handle: &AppHandle, companion: &CompanionState, 
 
 fn parse_button_event(line: &str) -> Option<DeviceButtonEvent> {
     let mut parts = line.split_whitespace();
-    if parts.next()? != "CDC:EVENT" || parts.next()? != "BUTTON" {
+    if parts.next()? != "CDC:EVENT" {
+        return None;
+    }
+
+    let event_type = parts.next()?;
+    if event_type != "BUTTON" && event_type != "RADIAL" {
         return None;
     }
 
     let index = parts.next()?.parse::<u8>().ok()?;
     let row = parts.next()?.parse::<u8>().ok()?;
     let col = parts.next()?.parse::<u8>().ok()?;
+    let direction = if event_type == "RADIAL" {
+        let direction = parts.next()?;
+        Some(normalized_radial_direction(direction)?)
+    } else {
+        None
+    };
 
-    Some(DeviceButtonEvent { index, row, col })
+    Some(DeviceButtonEvent {
+        index,
+        row,
+        col,
+        direction,
+    })
 }
 
 fn read_listener_line(
@@ -530,7 +655,13 @@ fn execute_host_actions(
     button: DeviceButtonEvent,
     actions: Vec<HostCommandAction>,
 ) {
-    let button_label = format!("button {} ({},{})", button.index, button.row, button.col);
+    let button_label = match button.direction.as_deref() {
+        Some(direction) => format!(
+            "radial {} {} ({},{})",
+            button.index, direction, button.row, button.col
+        ),
+        None => format!("button {} ({},{})", button.index, button.row, button.col),
+    };
     if actions.is_empty() {
         update_companion_status(&app_handle, &companion, |status| {
             status.last_execution = Some(format!("No host actions configured for {button_label}"));
@@ -613,17 +744,25 @@ fn execute_host_actions(
 
 fn handle_listener_line(app_handle: &AppHandle, companion: &CompanionState, line: &str) {
     if let Some(event) = parse_button_event(line) {
+        let action_key = event
+            .direction
+            .as_deref()
+            .map(|direction| radial_action_key(event.index, direction))
+            .unwrap_or_else(|| button_action_key(event.index));
         let actions = {
             let shared = companion.shared.lock().unwrap();
             shared
                 .host_actions
-                .get(&event.index)
+                .get(&action_key)
                 .cloned()
                 .unwrap_or_default()
         };
 
         update_companion_status(app_handle, companion, |status| {
-            status.last_event = Some(format!("Button {} pressed", event.index));
+            status.last_event = Some(match event.direction.as_deref() {
+                Some(direction) => format!("Radial {} {} released", event.index, direction),
+                None => format!("Button {} pressed", event.index),
+            });
         });
         let _ = app_handle.emit_all(DEVICE_BUTTON_EVENT, event.clone());
 
@@ -1478,7 +1617,17 @@ fn send_updates_impl(
             ));
         }
 
-        let remote = format!("/icon_{}_{}.bin", icon.row, icon.col);
+        let remote = if let Some(direction) = icon.direction.as_deref() {
+            let Some(direction) = normalized_radial_direction(direction) else {
+                return Err(format!(
+                    "Icon {} has invalid radial direction '{}'",
+                    icon.index, direction
+                ));
+            };
+            format!("/radial_{}_{}_{}.bin", icon.row, icon.col, direction)
+        } else {
+            format!("/icon_{}_{}.bin", icon.row, icon.col)
+        };
         logs.push(format!("Uploading icon {} -> {}", icon.index, remote));
         let progress = UploadProgressTracker {
             app_handle: &app_handle,
@@ -1690,13 +1839,49 @@ fn sync_from_device_impl(request: SyncFromDeviceRequest) -> Result<SyncFromDevic
                         continue;
                     }
 
-                    icon_downloads.push(IconDownload { row, col, bytes });
+                    icon_downloads.push(IconDownload {
+                        row,
+                        col,
+                        direction: None,
+                        bytes,
+                    });
                 }
                 Ok(None) => {}
                 Err(err) => {
                     logs.push(format!("ERROR: {err}"));
                     return Err(format!("{err}\n---LOGS---\n{}", logs.join("\n")));
                 }
+            }
+        }
+    }
+
+    for (row, col, direction) in collect_radial_icon_downloads(&macros_json) {
+        let remote = format!("/radial_{}_{}_{}.bin", row, col, direction);
+        logs.push(format!("Downloading {} (optional)", remote));
+
+        match download_file(port.as_mut(), &remote, &mut logs) {
+            Ok(Some(bytes)) => {
+                if bytes.len() != ICON_BYTE_SIZE {
+                    logs.push(format!(
+                        "Ignoring {} due to size mismatch (got {}, expected {})",
+                        remote,
+                        bytes.len(),
+                        ICON_BYTE_SIZE
+                    ));
+                    continue;
+                }
+
+                icon_downloads.push(IconDownload {
+                    row,
+                    col,
+                    direction: Some(direction),
+                    bytes,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                logs.push(format!("ERROR: {err}"));
+                return Err(format!("{err}\n---LOGS---\n{}", logs.join("\n")));
             }
         }
     }

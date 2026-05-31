@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdarg>
+#include <cmath>
 #include "lvgl_v8_port.h"
 #include "waveshare_sd_card.h"
 
@@ -35,10 +36,15 @@
 
 // Macro configuration
 #define MACRO_CONFIG_PATH "/macros.json"
-#define MACRO_CONFIG_VERSION 1
+#define MACRO_CONFIG_VERSION 2
 #define MAX_ACTIONS_PER_ICON 24
 #define FALLBACK_ICON_PATH "/fallback.bin"
 #define ICON_FORMAT "/icon_%d_%d.bin"  // Format: icon_row_col.bin
+#define RADIAL_ICON_FORMAT "/radial_%d_%d_%s.bin"
+#define RADIAL_DIRECTION_COUNT 8
+#define RADIAL_MENU_GAP 17
+#define RADIAL_MENU_OPEN_DRAG_PX 5
+#define RADIAL_MENU_DEADZONE_PX 42
 
 #ifndef KEY_LEFT_CTRL
 #define KEY_LEFT_CTRL 0x80
@@ -172,7 +178,7 @@
 #endif
 
 // Screensaver configuration
-#define SCREENSAVER_TIMEOUT_MS 600000      // 1 minute
+#define SCREENSAVER_TIMEOUT_MS 6000000      // 1 minute
 #define SCREENSAVER_CHECK_INTERVAL_MS 1000
 
 // Forward declarations (used before definitions)
@@ -213,16 +219,26 @@ struct MacroAction {
   uint16_t delayMs = 0;
 };
 
-struct IconMacro {
+struct MacroSequence {
   MacroAction actions[MAX_ACTIONS_PER_ICON];
   uint8_t actionCount = 0;
+};
+
+struct RadialMacroItem : MacroSequence {
+  bool configured = false;
+};
+
+struct IconMacro : MacroSequence {
+  bool radialEnabled = false;
+  RadialMacroItem radialItems[RADIAL_DIRECTION_COUNT];
 };
 
 struct MacroExecutorState {
   bool active = false;
   bool comboPressed = false;
-  uint8_t iconIndex = 0;
   uint8_t actionIndex = 0;
+  uint8_t actionCount = 0;
+  const MacroAction* actions = nullptr;
   unsigned long nextActionAtMs = 0;
 };
 
@@ -245,6 +261,22 @@ enum class CdcPortId : uint8_t {
 IconMacro g_iconMacros[TOTAL_BUTTONS];
 MacroExecutorState g_macroExecutor;
 CdcUploadSession g_cdcUpload;
+
+struct RadialMenuState {
+  bool active = false;
+  bool suppressNextClick = false;
+  uint8_t iconIndex = 0;
+  int row = 0;
+  int col = 0;
+  int selectedDirection = -1;
+  lv_point_t origin = {0, 0};
+  lv_point_t pressPoint = {0, 0};
+  bool hasPressPoint = false;
+  lv_obj_t* overlay = nullptr;
+  lv_obj_t* itemObjects[RADIAL_DIRECTION_COUNT] = {nullptr};
+};
+
+RadialMenuState g_radialMenu;
 
 static lv_style_t g_buttonTapStyleDefault;
 static lv_style_t g_buttonTapStylePressed;
@@ -344,6 +376,14 @@ static void emitButtonEvent(uint8_t iconIndex, int row, int col) {
   cdcBroadcast("CDC:EVENT BUTTON %u %d %d", iconIndex, row, col);
 }
 
+static void emitRadialEvent(uint8_t iconIndex, int row, int col, const char* direction) {
+  if (g_cdcUpload.active || direction == nullptr) {
+    return;
+  }
+
+  cdcBroadcast("CDC:EVENT RADIAL %u %d %d %s", iconIndex, row, col, direction);
+}
+
 [[noreturn]] static void haltWithError(const char* message) {
   Serial.println(message);
   while (true) {
@@ -385,6 +425,45 @@ static bool startsWithIgnoreCase(const char* value, const char* prefix) {
     prefix++;
   }
 
+  return true;
+}
+
+static const char* radialDirectionName(uint8_t directionIndex) {
+  static const char* kDirectionNames[RADIAL_DIRECTION_COUNT] = {
+      "n", "ne", "e", "se", "s", "sw", "w", "nw"};
+
+  if (directionIndex >= RADIAL_DIRECTION_COUNT) {
+    return "";
+  }
+  return kDirectionNames[directionIndex];
+}
+
+static bool radialDirectionIndexFromName(const char* name, uint8_t& directionIndex) {
+  if (name == nullptr || name[0] == '\0') {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < RADIAL_DIRECTION_COUNT; i++) {
+    if (equalsIgnoreCase(name, radialDirectionName(i))) {
+      directionIndex = i;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool radialDirectionOffset(uint8_t directionIndex, int& offsetX, int& offsetY) {
+  static const int8_t kOffsets[RADIAL_DIRECTION_COUNT][2] = {
+      {0, -1}, {1, -1}, {1, 0}, {1, 1},
+      {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}};
+
+  if (directionIndex >= RADIAL_DIRECTION_COUNT) {
+    return false;
+  }
+
+  offsetX = kOffsets[directionIndex][0];
+  offsetY = kOffsets[directionIndex][1];
   return true;
 }
 
@@ -531,6 +610,26 @@ static bool parseIconPath(const char* path, int& row, int& col) {
   return row >= 0 && row < GRID_ROWS && col >= 0 && col < GRID_COLS;
 }
 
+static bool parseRadialIconPath(const char* path, int& row, int& col, uint8_t& directionIndex) {
+  if (path == nullptr) {
+    return false;
+  }
+
+  char direction[4] = {0};
+  int parsedChars = 0;
+  if (sscanf(path, "/radial_%d_%d_%3[a-zA-Z]%n", &row, &col, direction,
+             &parsedChars) != 3) {
+    return false;
+  }
+
+  if (path[parsedChars] != '.' || strcmp(path + parsedChars, ".bin") != 0) {
+    return false;
+  }
+
+  return row >= 0 && row < GRID_ROWS && col >= 0 && col < GRID_COLS &&
+         radialDirectionIndexFromName(direction, directionIndex);
+}
+
 static bool isAllowedUploadPath(const char* path) {
   if (path == nullptr) {
     return false;
@@ -543,7 +642,9 @@ static bool isAllowedUploadPath(const char* path) {
 
   int row = -1;
   int col = -1;
-  return parseIconPath(path, row, col);
+  uint8_t directionIndex = 0;
+  return parseIconPath(path, row, col) ||
+         parseRadialIconPath(path, row, col, directionIndex);
 }
 
 static bool isIconAssetPath(const char* path) {
@@ -557,12 +658,19 @@ static bool isIconAssetPath(const char* path) {
 
   int row = -1;
   int col = -1;
-  return parseIconPath(path, row, col);
+  uint8_t directionIndex = 0;
+  return parseIconPath(path, row, col) ||
+         parseRadialIconPath(path, row, col, directionIndex);
 }
 
 static void clearMacroConfig() {
   for (int i = 0; i < TOTAL_BUTTONS; i++) {
     g_iconMacros[i].actionCount = 0;
+    g_iconMacros[i].radialEnabled = false;
+    for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+      g_iconMacros[i].radialItems[direction].actionCount = 0;
+      g_iconMacros[i].radialItems[direction].configured = false;
+    }
   }
 }
 
@@ -597,6 +705,61 @@ static uint8_t parseModifiers(JsonVariantConst modifiersValue) {
   return modifiers;
 }
 
+static uint8_t parseMacroActions(JsonArrayConst actions, MacroAction* output,
+                                 const char* contextLabel, int iconIndex) {
+  if (actions.isNull() || output == nullptr) {
+    return 0;
+  }
+
+  uint8_t actionCount = 0;
+  for (JsonVariantConst actionValue : actions) {
+    JsonObjectConst actionObj = actionValue.as<JsonObjectConst>();
+    if (actionObj.isNull()) {
+      continue;
+    }
+
+    if (actionCount >= MAX_ACTIONS_PER_ICON) {
+      Serial.printf("%s %d has too many actions (max %d)\n", contextLabel, iconIndex,
+                    MAX_ACTIONS_PER_ICON);
+      break;
+    }
+
+    const char* actionType = actionObj["type"] | "";
+    MacroAction action;
+
+    if (equalsIgnoreCase(actionType, "combo")) {
+      uint8_t keycode = 0;
+      const char* keyName = actionObj["key"] | "";
+      if (!keyNameToKeycode(keyName, keycode)) {
+        Serial.printf("Invalid key '%s' on %s %d, action skipped\n", keyName,
+                      contextLabel, iconIndex);
+        continue;
+      }
+
+      action.type = MacroActionType::Combo;
+      action.keycode = keycode;
+      action.modifiers = parseModifiers(actionObj["mods"]);
+    } else if (equalsIgnoreCase(actionType, "delay")) {
+      int delayMs = actionObj["ms"] | 0;
+      if (delayMs < 0) {
+        delayMs = 0;
+      }
+      if (delayMs > 60000) {
+        delayMs = 60000;
+      }
+
+      action.type = MacroActionType::Delay;
+      action.delayMs = static_cast<uint16_t>(delayMs);
+    } else {
+      continue;
+    }
+
+    output[actionCount++] = action;
+  }
+
+  return actionCount;
+}
+
 static void ensureMacroConfigFileExists() {
   if (SD.exists(MACRO_CONFIG_PATH)) {
     return;
@@ -609,7 +772,7 @@ static void ensureMacroConfigFileExists() {
   }
 
   file.println("{");
-  file.println("  \"version\": 1,");
+  file.println("  \"version\": 2,");
   file.println("  \"grid\": { \"rows\": 4, \"cols\": 8 },");
   file.println("  \"icons\": [");
 
@@ -664,8 +827,8 @@ static void loadMacroConfigFromSD() {
   }
 
   int version = doc["version"] | 0;
-  if (version != MACRO_CONFIG_VERSION) {
-    Serial.printf("macros.json version mismatch (got %d, expected %d)\n", version,
+  if (version != 1 && version != MACRO_CONFIG_VERSION) {
+    Serial.printf("macros.json version mismatch (got %d, expected 1 or %d)\n", version,
                   MACRO_CONFIG_VERSION);
   }
 
@@ -700,71 +863,71 @@ static void loadMacroConfigFromSD() {
     }
     seenIndexes[index] = true;
     g_iconMacros[index].actionCount = 0;
-
-    JsonArrayConst actions = icon["actions"].as<JsonArrayConst>();
-    if (actions.isNull()) {
-      continue;
+    g_iconMacros[index].radialEnabled = false;
+    for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+      g_iconMacros[index].radialItems[direction].actionCount = 0;
+      g_iconMacros[index].radialItems[direction].configured = false;
     }
 
-    for (JsonVariantConst actionValue : actions) {
-      JsonObjectConst actionObj = actionValue.as<JsonObjectConst>();
-      if (actionObj.isNull()) {
-        continue;
-      }
+    JsonArrayConst actions = icon["actions"].as<JsonArrayConst>();
+    g_iconMacros[index].actionCount =
+        parseMacroActions(actions, g_iconMacros[index].actions, "Icon", index);
 
-      if (g_iconMacros[index].actionCount >= MAX_ACTIONS_PER_ICON) {
-        Serial.printf("Icon %d has too many actions (max %d)\n", index, MAX_ACTIONS_PER_ICON);
-        break;
-      }
+    JsonObjectConst radial = icon["radial"].as<JsonObjectConst>();
+    if (!radial.isNull() && (radial["enabled"] | false)) {
+      g_iconMacros[index].radialEnabled = true;
+      JsonArrayConst radialItems = radial["items"].as<JsonArrayConst>();
+      if (!radialItems.isNull()) {
+        for (JsonVariantConst itemValue : radialItems) {
+          JsonObjectConst item = itemValue.as<JsonObjectConst>();
+          if (item.isNull()) {
+            continue;
+          }
 
-      const char* actionType = actionObj["type"] | "";
-      MacroAction action;
+          uint8_t directionIndex = 0;
+          const char* directionName = item["direction"] | "";
+          if (!radialDirectionIndexFromName(directionName, directionIndex)) {
+            Serial.printf("Invalid radial direction '%s' on icon %d\n", directionName,
+                          index);
+            continue;
+          }
 
-      if (equalsIgnoreCase(actionType, "combo")) {
-        uint8_t keycode = 0;
-        const char* keyName = actionObj["key"] | "";
-        if (!keyNameToKeycode(keyName, keycode)) {
-          Serial.printf("Invalid key '%s' on icon %d, action skipped\n", keyName, index);
-          continue;
+          RadialMacroItem& radialItem = g_iconMacros[index].radialItems[directionIndex];
+          radialItem.actionCount = parseMacroActions(
+              item["actions"].as<JsonArrayConst>(), radialItem.actions, "Radial item",
+              index);
+
+          JsonArrayConst hostActions = item["hostActions"].as<JsonArrayConst>();
+          radialItem.configured =
+              radialItem.actionCount > 0 ||
+              (!hostActions.isNull() && hostActions.size() > 0);
         }
-
-        action.type = MacroActionType::Combo;
-        action.keycode = keycode;
-        action.modifiers = parseModifiers(actionObj["mods"]);
-      } else if (equalsIgnoreCase(actionType, "delay")) {
-        int delayMs = actionObj["ms"] | 0;
-        if (delayMs < 0) {
-          delayMs = 0;
-        }
-        if (delayMs > 60000) {
-          delayMs = 60000;
-        }
-
-        action.type = MacroActionType::Delay;
-        action.delayMs = static_cast<uint16_t>(delayMs);
-      } else {
-        continue;
       }
-
-      g_iconMacros[index].actions[g_iconMacros[index].actionCount++] = action;
     }
   }
 
   int configuredIcons = 0;
   int totalActions = 0;
+  int configuredRadialItems = 0;
   int missingIcons = 0;
   for (int i = 0; i < TOTAL_BUTTONS; i++) {
     if (g_iconMacros[i].actionCount > 0) {
       configuredIcons++;
       totalActions += g_iconMacros[i].actionCount;
     }
+    for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+      if (g_iconMacros[i].radialItems[direction].configured) {
+        configuredRadialItems++;
+        totalActions += g_iconMacros[i].radialItems[direction].actionCount;
+      }
+    }
     if (!seenIndexes[i]) {
       missingIcons++;
     }
   }
 
-  Serial.printf("Loaded macros.json: %d icons with actions, %d total actions\n", configuredIcons,
-                totalActions);
+  Serial.printf("Loaded macros.json: %d icons with actions, %d radial items, %d total actions\n",
+                configuredIcons, configuredRadialItems, totalActions);
   if (missingIcons > 0) {
     Serial.printf("Warning: %d icon entries missing in macros.json\n", missingIcons);
   }
@@ -806,18 +969,15 @@ static void initUSBKeyboard() {
 #endif
 }
 
-static void queueMacroForIcon(uint8_t iconIndex) {
-  if (iconIndex >= TOTAL_BUTTONS) {
-    return;
-  }
-
+static void queueMacroActions(const MacroAction* actions, uint8_t actionCount,
+                              const char* sourceLabel) {
   if (!usbKeyboardReady) {
     Serial.println("USB not ready, macro ignored");
     return;
   }
 
-  if (g_iconMacros[iconIndex].actionCount == 0) {
-    Serial.printf("Icon %u has no macro actions\n", iconIndex);
+  if (actions == nullptr || actionCount == 0) {
+    Serial.printf("%s has no macro actions\n", sourceLabel);
     return;
   }
 
@@ -827,12 +987,23 @@ static void queueMacroForIcon(uint8_t iconIndex) {
 
   g_macroExecutor.active = true;
   g_macroExecutor.comboPressed = false;
-  g_macroExecutor.iconIndex = iconIndex;
   g_macroExecutor.actionIndex = 0;
+  g_macroExecutor.actionCount = actionCount;
+  g_macroExecutor.actions = actions;
   g_macroExecutor.nextActionAtMs = millis();
 
-  Serial.printf("Queued macro for icon %u (%u actions)\n", iconIndex,
-                g_iconMacros[iconIndex].actionCount);
+  Serial.printf("Queued macro for %s (%u actions)\n", sourceLabel, actionCount);
+}
+
+static void queueMacroForIcon(uint8_t iconIndex) {
+  if (iconIndex >= TOTAL_BUTTONS) {
+    return;
+  }
+
+  char label[24];
+  snprintf(label, sizeof(label), "icon %u", iconIndex);
+  queueMacroActions(g_iconMacros[iconIndex].actions, g_iconMacros[iconIndex].actionCount,
+                    label);
 }
 
 static void tickMacroExecutor() {
@@ -845,15 +1016,17 @@ static void tickMacroExecutor() {
     return;
   }
 
-  IconMacro& macro = g_iconMacros[g_macroExecutor.iconIndex];
-  if (g_macroExecutor.actionIndex >= macro.actionCount) {
+  if (g_macroExecutor.actions == nullptr ||
+      g_macroExecutor.actionIndex >= g_macroExecutor.actionCount) {
     keyboard.releaseAll();
     g_macroExecutor.active = false;
     g_macroExecutor.comboPressed = false;
+    g_macroExecutor.actions = nullptr;
+    g_macroExecutor.actionCount = 0;
     return;
   }
 
-  const MacroAction& action = macro.actions[g_macroExecutor.actionIndex];
+  const MacroAction& action = g_macroExecutor.actions[g_macroExecutor.actionIndex];
   if (action.type == MacroActionType::Delay) {
     g_macroExecutor.actionIndex++;
     g_macroExecutor.nextActionAtMs = now + action.delayMs;
@@ -1090,15 +1263,22 @@ static void handleCdcCommand(CdcPortId sourcePort, const char* line) {
 
   if (equalsIgnoreCase(line, "STATUS")) {
     int configuredIcons = 0;
+    int configuredRadialItems = 0;
     for (int i = 0; i < TOTAL_BUTTONS; i++) {
       if (g_iconMacros[i].actionCount > 0) {
         configuredIcons++;
       }
+      for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+        if (g_iconMacros[i].radialItems[direction].configured) {
+          configuredRadialItems++;
+        }
+      }
     }
 
-    cdcReplyToPort(sourcePort, "CDC:STATUS sd=%d usb=%d macros=%d active=%d events=1 proto=2",
+    cdcReplyToPort(sourcePort,
+                   "CDC:STATUS sd=%d usb=%d macros=%d radial=%d active=%d events=1 proto=3",
                    sdCardInitialized ? 1 : 0, usbKeyboardReady ? 1 : 0,
-                   configuredIcons, g_macroExecutor.active ? 1 : 0);
+                   configuredIcons, configuredRadialItems, g_macroExecutor.active ? 1 : 0);
     return;
   }
 
@@ -1448,6 +1628,236 @@ lv_obj_t* create_icon_image(const char* path) {
   return img;
 }
 
+static bool getActivePointerPoint(lv_point_t& point) {
+  lv_indev_t* indev = lv_indev_get_act();
+  if (indev == nullptr) {
+    return false;
+  }
+
+  lv_indev_get_point(indev, &point);
+  return true;
+}
+
+static int radialDirectionFromPoint(const lv_point_t& point) {
+  int dx = point.x - g_radialMenu.origin.x;
+  int dy = point.y - g_radialMenu.origin.y;
+  int maxDelta = max(abs(dx), abs(dy));
+  if (maxDelta < RADIAL_MENU_DEADZONE_PX) {
+    return -1;
+  }
+
+  float angle = atan2f(static_cast<float>(-dy), static_cast<float>(dx)) * 180.0f /
+                3.14159265f;
+  if (angle < 0.0f) {
+    angle += 360.0f;
+  }
+
+  int sector = static_cast<int>(floorf((angle + 22.5f) / 45.0f)) % 8;
+  static const int8_t kSectorToDirection[8] = {
+      2, 1, 0, 7, 6, 5, 4, 3};
+  return kSectorToDirection[sector];
+}
+
+static bool radialDragExceededOpenThreshold(const lv_point_t& point) {
+  if (!g_radialMenu.hasPressPoint) {
+    return false;
+  }
+
+  int dx = point.x - g_radialMenu.pressPoint.x;
+  int dy = point.y - g_radialMenu.pressPoint.y;
+  return max(abs(dx), abs(dy)) >= RADIAL_MENU_OPEN_DRAG_PX;
+}
+
+static void updateRadialSelection(int selectedDirection) {
+  g_radialMenu.selectedDirection = selectedDirection;
+
+  for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+    lv_obj_t* item = g_radialMenu.itemObjects[direction];
+    if (item == nullptr) {
+      continue;
+    }
+
+    bool configured =
+        g_iconMacros[g_radialMenu.iconIndex].radialItems[direction].configured;
+    bool selected = selectedDirection == direction;
+    lv_obj_set_style_border_width(item, selected ? 3 : 1, 0);
+    lv_obj_set_style_border_color(
+        item, lv_color_hex(selected ? 0xFFFFFF : configured ? 0x4C4C4C : 0x272727),
+        0);
+    lv_obj_set_style_bg_color(
+        item, lv_color_hex(selected ? 0x2E7D70 : configured ? 0x101010 : 0x050505),
+        0);
+    lv_obj_set_style_bg_opa(item, configured ? LV_OPA_COVER : LV_OPA_50, 0);
+  }
+}
+
+static void hideRadialMenu() {
+  if (g_radialMenu.overlay != nullptr) {
+    lv_obj_del(g_radialMenu.overlay);
+  }
+
+  g_radialMenu.active = false;
+  g_radialMenu.overlay = nullptr;
+  g_radialMenu.selectedDirection = -1;
+  for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+    g_radialMenu.itemObjects[direction] = nullptr;
+  }
+}
+
+static void showRadialMenu(uint8_t iconIndex, int row, int col,
+                           const lv_point_t& origin);
+
+static void maybeOpenRadialMenuFromDrag(uint8_t iconIndex, int row, int col) {
+  if (g_radialMenu.active || iconIndex >= TOTAL_BUTTONS ||
+      !g_iconMacros[iconIndex].radialEnabled) {
+    return;
+  }
+
+  lv_point_t point;
+  if (!getActivePointerPoint(point) || !radialDragExceededOpenThreshold(point)) {
+    return;
+  }
+
+  showRadialMenu(iconIndex, row, col, g_radialMenu.origin);
+  updateRadialSelection(radialDirectionFromPoint(point));
+}
+
+static void showRadialMenu(uint8_t iconIndex, int row, int col, const lv_point_t& origin) {
+  if (iconIndex >= TOTAL_BUTTONS || !g_iconMacros[iconIndex].radialEnabled) {
+    return;
+  }
+
+  hideRadialMenu();
+
+  g_radialMenu.active = true;
+  g_radialMenu.suppressNextClick = true;
+  g_radialMenu.iconIndex = iconIndex;
+  g_radialMenu.row = row;
+  g_radialMenu.col = col;
+  g_radialMenu.origin = origin;
+
+  lv_obj_t* screen = lv_scr_act();
+  g_radialMenu.overlay = lv_obj_create(screen);
+  lv_obj_remove_style_all(g_radialMenu.overlay);
+  lv_obj_set_size(g_radialMenu.overlay, 800, 480);
+  lv_obj_set_pos(g_radialMenu.overlay, 0, 0);
+  lv_obj_set_style_bg_color(g_radialMenu.overlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(g_radialMenu.overlay, LV_OPA_50, 0);
+  lv_obj_clear_flag(g_radialMenu.overlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_move_foreground(g_radialMenu.overlay);
+
+  int menuSize = BUTTON_SIZE * 3 + RADIAL_MENU_GAP * 2;
+  int menuX = origin.x - menuSize / 2;
+  int menuY = origin.y - menuSize / 2;
+  menuX = max(0, min(800 - menuSize, menuX));
+  menuY = max(0, min(480 - menuSize, menuY));
+
+  for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+    int offsetX = 0;
+    int offsetY = 0;
+    if (!radialDirectionOffset(direction, offsetX, offsetY)) {
+      continue;
+    }
+
+    bool configured = g_iconMacros[iconIndex].radialItems[direction].configured;
+    int itemX = menuX + (offsetX + 1) * (BUTTON_SIZE + RADIAL_MENU_GAP);
+    int itemY = menuY + (offsetY + 1) * (BUTTON_SIZE + RADIAL_MENU_GAP);
+
+    lv_obj_t* item = lv_obj_create(g_radialMenu.overlay);
+    lv_obj_remove_style_all(item);
+    lv_obj_set_size(item, BUTTON_SIZE, BUTTON_SIZE);
+    lv_obj_set_pos(item, itemX, itemY);
+    lv_obj_set_style_bg_color(item, lv_color_hex(configured ? 0x101010 : 0x050505), 0);
+    lv_obj_set_style_bg_opa(item, configured ? LV_OPA_COVER : LV_OPA_50, 0);
+    lv_obj_set_style_border_width(item, 1, 0);
+    lv_obj_set_style_border_color(item, lv_color_hex(configured ? 0x4C4C4C : 0x272727), 0);
+    lv_obj_set_style_radius(item, 0, 0);
+    lv_obj_clear_flag(item, LV_OBJ_FLAG_CLICKABLE);
+    g_radialMenu.itemObjects[direction] = item;
+
+    if (configured) {
+      char radialPath[40];
+      snprintf(radialPath, sizeof(radialPath), RADIAL_ICON_FORMAT, row, col,
+               radialDirectionName(direction));
+      lv_obj_t* icon = create_icon_image(radialPath);
+      if (icon) {
+        lv_obj_set_parent(icon, item);
+        lv_obj_center(icon);
+        lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+      } else {
+        lv_obj_t* label = lv_label_create(item);
+        lv_label_set_text(label, radialDirectionName(direction));
+        lv_obj_set_style_text_color(label, lv_color_hex(0xD0D0D0), 0);
+        lv_obj_center(label);
+      }
+    }
+  }
+
+  lv_obj_t* center = lv_obj_create(g_radialMenu.overlay);
+  lv_obj_remove_style_all(center);
+  lv_obj_set_size(center, BUTTON_SIZE, BUTTON_SIZE);
+  lv_obj_set_pos(center, menuX + BUTTON_SIZE + RADIAL_MENU_GAP,
+                 menuY + BUTTON_SIZE + RADIAL_MENU_GAP);
+  lv_obj_set_style_bg_color(center, lv_color_hex(0x101010), 0);
+  lv_obj_set_style_bg_opa(center, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(center, 1, 0);
+  lv_obj_set_style_border_color(center, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_radius(center, 0, 0);
+  lv_obj_clear_flag(center, LV_OBJ_FLAG_CLICKABLE);
+
+  char centerIconPath[32];
+  snprintf(centerIconPath, sizeof(centerIconPath), ICON_FORMAT, row, col);
+  lv_obj_t* centerIcon = create_icon_image(centerIconPath);
+  if (centerIcon) {
+    lv_obj_set_parent(centerIcon, center);
+    lv_obj_center(centerIcon);
+    lv_obj_clear_flag(centerIcon, LV_OBJ_FLAG_CLICKABLE);
+  }
+
+  updateRadialSelection(-1);
+}
+
+static void updateRadialMenuFromTouch() {
+  if (!g_radialMenu.active) {
+    return;
+  }
+
+  lv_point_t point;
+  if (!getActivePointerPoint(point)) {
+    return;
+  }
+
+  updateRadialSelection(radialDirectionFromPoint(point));
+}
+
+static void executeRadialMenuSelection() {
+  if (!g_radialMenu.active) {
+    return;
+  }
+
+  int selectedDirection = g_radialMenu.selectedDirection;
+  if (selectedDirection < 0 || selectedDirection >= RADIAL_DIRECTION_COUNT) {
+    return;
+  }
+
+  RadialMacroItem& item =
+      g_iconMacros[g_radialMenu.iconIndex].radialItems[selectedDirection];
+  if (!item.configured) {
+    return;
+  }
+
+  const char* directionName = radialDirectionName(selectedDirection);
+  Serial.printf("Radial selected: icon=%u direction=%s\n", g_radialMenu.iconIndex,
+                directionName);
+  emitRadialEvent(g_radialMenu.iconIndex, g_radialMenu.row, g_radialMenu.col,
+                  directionName);
+
+  char label[32];
+  snprintf(label, sizeof(label), "radial %u %s", g_radialMenu.iconIndex,
+           directionName);
+  queueMacroActions(item.actions, item.actionCount, label);
+}
+
 void rebuildGridUI() {
   lvgl_port_lock(-1);
   ensureButtonTapStyles();
@@ -1457,6 +1867,12 @@ void rebuildGridUI() {
 
   screensaverObj = nullptr;
   isScreensaverActive = false;
+  g_radialMenu.active = false;
+  g_radialMenu.overlay = nullptr;
+  g_radialMenu.selectedDirection = -1;
+  for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+    g_radialMenu.itemObjects[direction] = nullptr;
+  }
 
   lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
 
@@ -1480,6 +1896,7 @@ void rebuildGridUI() {
       lv_obj_set_size(btn, BUTTON_SIZE, BUTTON_SIZE);
       lv_obj_set_pos(btn, start_x + col * (BUTTON_SIZE + BUTTON_GAP),
                      start_y + row * (BUTTON_SIZE + BUTTON_GAP));
+      lv_obj_add_flag(btn, LV_OBJ_FLAG_PRESS_LOCK);
       lv_obj_add_style(btn, &g_buttonTapStyleDefault, 0);
       lv_obj_add_style(btn, &g_buttonTapStylePressed, LV_STATE_PRESSED);
 
@@ -1491,8 +1908,8 @@ void rebuildGridUI() {
 
       lv_obj_t* icon = create_icon_image(icon_path);
       if (icon) {
-        lv_obj_center(icon);
         lv_obj_set_parent(icon, btn);
+        lv_obj_center(icon);
       } else {
         lv_obj_t* label = lv_label_create(btn);
         lv_label_set_text_fmt(label, "%d,%d", row, col);
@@ -1500,7 +1917,7 @@ void rebuildGridUI() {
         lv_obj_center(label);
       }
 
-      lv_obj_add_event_cb(btn, btn_event_handler, LV_EVENT_CLICKED, nullptr);
+      lv_obj_add_event_cb(btn, btn_event_handler, LV_EVENT_ALL, nullptr);
     }
   }
 
@@ -1513,12 +1930,68 @@ static void btn_event_handler(lv_event_t* e) {
   // Reset the activity timer on any button interaction
   resetActivityTimer();
 
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-    lv_obj_t* btn = lv_event_get_target(e);
-    uint32_t position = (uint32_t)lv_obj_get_user_data(btn);
-    int row = position >> 16;
-    int col = position & 0xFFFF;
-    int iconIndex = row * GRID_COLS + col;
+  lv_obj_t* btn = lv_event_get_target(e);
+  uint32_t position = (uint32_t)lv_obj_get_user_data(btn);
+  int row = position >> 16;
+  int col = position & 0xFFFF;
+  int iconIndex = row * GRID_COLS + col;
+  lv_event_code_t code = lv_event_get_code(e);
+
+  if (code == LV_EVENT_PRESSED) {
+    g_radialMenu.suppressNextClick = false;
+    g_radialMenu.hasPressPoint = false;
+    lv_area_t coords;
+    lv_obj_get_coords(btn, &coords);
+    g_radialMenu.origin.x = (coords.x1 + coords.x2) / 2;
+    g_radialMenu.origin.y = (coords.y1 + coords.y2) / 2;
+
+    if (getActivePointerPoint(g_radialMenu.pressPoint)) {
+      g_radialMenu.hasPressPoint = true;
+    } else {
+      g_radialMenu.pressPoint = g_radialMenu.origin;
+      g_radialMenu.hasPressPoint = true;
+    }
+    return;
+  }
+
+  if (code == LV_EVENT_LONG_PRESSED) {
+    return;
+  }
+
+  if (code == LV_EVENT_PRESSING) {
+    if (g_radialMenu.active) {
+      updateRadialMenuFromTouch();
+    } else if (iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
+      maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col);
+    }
+    return;
+  }
+
+  if (code == LV_EVENT_RELEASED) {
+    if (!g_radialMenu.active && iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
+      maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col);
+    }
+
+    if (g_radialMenu.active) {
+      updateRadialMenuFromTouch();
+      executeRadialMenuSelection();
+      hideRadialMenu();
+    }
+    return;
+  }
+
+  if (code == LV_EVENT_PRESS_LOST) {
+    if (g_radialMenu.active) {
+      hideRadialMenu();
+    }
+    return;
+  }
+
+  if (code == LV_EVENT_CLICKED) {
+    if (g_radialMenu.suppressNextClick) {
+      g_radialMenu.suppressNextClick = false;
+      return;
+    }
 
     Serial.printf("Button clicked: row=%d col=%d index=%d\n", row, col,
                   iconIndex);
