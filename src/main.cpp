@@ -43,6 +43,7 @@
 #define RADIAL_ICON_FORMAT "/radial_%d_%d_%s.bin"
 #define RADIAL_DIRECTION_COUNT 8
 #define RADIAL_MENU_GAP 17
+#define RADIAL_MENU_OPEN_DRAG_PX 5
 #define RADIAL_MENU_DEADZONE_PX 42
 
 #ifndef KEY_LEFT_CTRL
@@ -177,7 +178,7 @@
 #endif
 
 // Screensaver configuration
-#define SCREENSAVER_TIMEOUT_MS 600000      // 1 minute
+#define SCREENSAVER_TIMEOUT_MS 6000000      // 1 minute
 #define SCREENSAVER_CHECK_INTERVAL_MS 1000
 
 // Forward declarations (used before definitions)
@@ -269,6 +270,8 @@ struct RadialMenuState {
   int col = 0;
   int selectedDirection = -1;
   lv_point_t origin = {0, 0};
+  lv_point_t pressPoint = {0, 0};
+  bool hasPressPoint = false;
   lv_obj_t* overlay = nullptr;
   lv_obj_t* itemObjects[RADIAL_DIRECTION_COUNT] = {nullptr};
 };
@@ -1655,6 +1658,16 @@ static int radialDirectionFromPoint(const lv_point_t& point) {
   return kSectorToDirection[sector];
 }
 
+static bool radialDragExceededOpenThreshold(const lv_point_t& point) {
+  if (!g_radialMenu.hasPressPoint) {
+    return false;
+  }
+
+  int dx = point.x - g_radialMenu.pressPoint.x;
+  int dy = point.y - g_radialMenu.pressPoint.y;
+  return max(abs(dx), abs(dy)) >= RADIAL_MENU_OPEN_DRAG_PX;
+}
+
 static void updateRadialSelection(int selectedDirection) {
   g_radialMenu.selectedDirection = selectedDirection;
 
@@ -1689,6 +1702,24 @@ static void hideRadialMenu() {
   for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
     g_radialMenu.itemObjects[direction] = nullptr;
   }
+}
+
+static void showRadialMenu(uint8_t iconIndex, int row, int col,
+                           const lv_point_t& origin);
+
+static void maybeOpenRadialMenuFromDrag(uint8_t iconIndex, int row, int col) {
+  if (g_radialMenu.active || iconIndex >= TOTAL_BUTTONS ||
+      !g_iconMacros[iconIndex].radialEnabled) {
+    return;
+  }
+
+  lv_point_t point;
+  if (!getActivePointerPoint(point) || !radialDragExceededOpenThreshold(point)) {
+    return;
+  }
+
+  showRadialMenu(iconIndex, row, col, g_radialMenu.origin);
+  updateRadialSelection(radialDirectionFromPoint(point));
 }
 
 static void showRadialMenu(uint8_t iconIndex, int row, int col, const lv_point_t& origin) {
@@ -1865,6 +1896,7 @@ void rebuildGridUI() {
       lv_obj_set_size(btn, BUTTON_SIZE, BUTTON_SIZE);
       lv_obj_set_pos(btn, start_x + col * (BUTTON_SIZE + BUTTON_GAP),
                      start_y + row * (BUTTON_SIZE + BUTTON_GAP));
+      lv_obj_add_flag(btn, LV_OBJ_FLAG_PRESS_LOCK);
       lv_obj_add_style(btn, &g_buttonTapStyleDefault, 0);
       lv_obj_add_style(btn, &g_buttonTapStylePressed, LV_STATE_PRESSED);
 
@@ -1907,28 +1939,39 @@ static void btn_event_handler(lv_event_t* e) {
 
   if (code == LV_EVENT_PRESSED) {
     g_radialMenu.suppressNextClick = false;
+    g_radialMenu.hasPressPoint = false;
     lv_area_t coords;
     lv_obj_get_coords(btn, &coords);
     g_radialMenu.origin.x = (coords.x1 + coords.x2) / 2;
     g_radialMenu.origin.y = (coords.y1 + coords.y2) / 2;
-    return;
-  }
 
-  if (code == LV_EVENT_LONG_PRESSED) {
-    if (iconIndex >= 0 && iconIndex < TOTAL_BUTTONS &&
-        g_iconMacros[iconIndex].radialEnabled) {
-      lv_point_t origin = g_radialMenu.origin;
-      showRadialMenu(static_cast<uint8_t>(iconIndex), row, col, origin);
+    if (getActivePointerPoint(g_radialMenu.pressPoint)) {
+      g_radialMenu.hasPressPoint = true;
+    } else {
+      g_radialMenu.pressPoint = g_radialMenu.origin;
+      g_radialMenu.hasPressPoint = true;
     }
     return;
   }
 
+  if (code == LV_EVENT_LONG_PRESSED) {
+    return;
+  }
+
   if (code == LV_EVENT_PRESSING) {
-    updateRadialMenuFromTouch();
+    if (g_radialMenu.active) {
+      updateRadialMenuFromTouch();
+    } else if (iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
+      maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col);
+    }
     return;
   }
 
   if (code == LV_EVENT_RELEASED) {
+    if (!g_radialMenu.active && iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
+      maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col);
+    }
+
     if (g_radialMenu.active) {
       updateRadialMenuFromTouch();
       executeRadialMenuSelection();
