@@ -1767,12 +1767,21 @@ static void showRadialMenu(uint8_t iconIndex, int row, int col, const lv_point_t
   lv_obj_set_size(center, BUTTON_SIZE, BUTTON_SIZE);
   lv_obj_set_pos(center, menuX + BUTTON_SIZE + RADIAL_MENU_GAP,
                  menuY + BUTTON_SIZE + RADIAL_MENU_GAP);
-  lv_obj_set_style_bg_color(center, lv_color_hex(0xD0D0D0), 0);
+  lv_obj_set_style_bg_color(center, lv_color_hex(0x101010), 0);
   lv_obj_set_style_bg_opa(center, LV_OPA_COVER, 0);
   lv_obj_set_style_border_width(center, 1, 0);
   lv_obj_set_style_border_color(center, lv_color_hex(0xFFFFFF), 0);
   lv_obj_set_style_radius(center, 0, 0);
   lv_obj_clear_flag(center, LV_OBJ_FLAG_CLICKABLE);
+
+  char centerIconPath[32];
+  snprintf(centerIconPath, sizeof(centerIconPath), ICON_FORMAT, row, col);
+  lv_obj_t* centerIcon = create_icon_image(centerIconPath);
+  if (centerIcon) {
+    lv_obj_set_parent(centerIcon, center);
+    lv_obj_center(centerIcon);
+    lv_obj_clear_flag(centerIcon, LV_OBJ_FLAG_CLICKABLE);
+  }
 
   updateRadialSelection(-1);
 }
@@ -1898,12 +1907,10 @@ static void btn_event_handler(lv_event_t* e) {
 
   if (code == LV_EVENT_PRESSED) {
     g_radialMenu.suppressNextClick = false;
-    if (!getActivePointerPoint(g_radialMenu.origin)) {
-      lv_area_t coords;
-      lv_obj_get_coords(btn, &coords);
-      g_radialMenu.origin.x = (coords.x1 + coords.x2) / 2;
-      g_radialMenu.origin.y = (coords.y1 + coords.y2) / 2;
-    }
+    lv_area_t coords;
+    lv_obj_get_coords(btn, &coords);
+    g_radialMenu.origin.x = (coords.x1 + coords.x2) / 2;
+    g_radialMenu.origin.y = (coords.y1 + coords.y2) / 2;
     return;
   }
 
