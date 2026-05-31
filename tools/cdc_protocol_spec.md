@@ -10,8 +10,8 @@ The protocol allows a desktop app (or test script) to:
 
 - query device status,
 - trigger live reloads,
-- upload `macros.json` and icon assets to SD,
-- download `macros.json` and icon assets from SD,
+- upload `macros.json`, home icon assets, and radial icon assets to SD,
+- download `macros.json`, home icon assets, and radial icon assets from SD,
 - apply changes without reboot.
 
 ## 2) Transport and USB mode
@@ -77,7 +77,7 @@ CDC:CMDS PING|STATUS|RELOAD <MACROS|ICONS|ALL>|PUT <path> <size>|GET <path>
 Response format:
 
 ```text
-CDC:STATUS sd=<0|1> usb=<0|1> macros=<int> active=<0|1>
+CDC:STATUS sd=<0|1> usb=<0|1> macros=<int> radial=<int> active=<0|1> events=1 proto=3
 ```
 
 Field meaning:
@@ -85,6 +85,7 @@ Field meaning:
 - `sd`: SD initialized.
 - `usb`: USB keyboard stack initialized.
 - `macros`: number of icon slots with non-empty action lists.
+- `radial`: number of configured radial menu items.
 - `active`: macro executor currently running an action sequence.
 
 ## 4.4 `RELOAD <target>`
@@ -128,7 +129,7 @@ CDC:OK PUT /macros.json 1234
 Then firmware applies updates:
 
 - `/macros.json` -> reloads macro config and emits `CDC:INFO RELOAD MACROS`
-- icon/fallback asset -> stores the file and emits `CDC:INFO ICON STORED`; send `RELOAD ICONS` or `RELOAD ALL` to rebuild the grid
+- icon/fallback/radial asset -> stores the file and emits `CDC:INFO ICON STORED`; send `RELOAD ICONS` or `RELOAD ALL` to rebuild the grid
 
 ## 4.6 `GET <path>`
 
@@ -163,6 +164,7 @@ Only these paths are accepted:
 - `/macros.json`
 - `/fallback.bin`
 - `/icon_<row>_<col>.bin` where `row` is `0..3`, `col` is `0..7`
+- `/radial_<row>_<col>_<direction>.bin` where `direction` is `n`, `ne`, `e`, `se`, `s`, `sw`, `w`, or `nw`
 
 Anything else returns:
 
@@ -266,13 +268,50 @@ reload      = "RELOAD" SP target
 target      = "MACROS" / "ICONS" / "ALL"
 put         = "PUT" SP path SP size
 get         = "GET" SP path
-path        = "/macros.json" / "/fallback.bin" / "/icon_" row "_" col ".bin"
+path        = "/macros.json" / "/fallback.bin" / "/icon_" row "_" col ".bin" / "/radial_" row "_" col "_" direction ".bin"
 row         = "0" / "1" / "2" / "3"
 col         = "0" / "1" / "2" / "3" / "4" / "5" / "6" / "7"
+direction   = "n" / "ne" / "e" / "se" / "s" / "sw" / "w" / "nw"
 size        = 1*DIGIT ; decimal integer 1..1048576
 ```
 
-## 12) Current non-goals / known gaps
+## 12) Macro config radial schema
+
+`macros.json` version `2` adds optional radial menu config. Firmware still accepts version `1` files.
+
+```json
+{
+  "version": 2,
+  "icons": [
+    {
+      "index": 0,
+      "row": 0,
+      "col": 0,
+      "actions": [],
+      "hostActions": [],
+      "radial": {
+        "enabled": true,
+        "items": [
+          {
+            "direction": "n",
+            "actions": [{ "type": "combo", "key": "A", "mods": [] }],
+            "hostActions": []
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+Touch events emitted for companion actions:
+
+```text
+CDC:EVENT BUTTON <index> <row> <col>
+CDC:EVENT RADIAL <index> <row> <col> <direction>
+```
+
+## 13) Current non-goals / known gaps
 
 - No authentication/authorization.
 - No payload checksum/CRC.
@@ -280,14 +319,14 @@ size        = 1*DIGIT ; decimal integer 1..1048576
 - No multipart/batch transaction command.
 - No explicit protocol version handshake.
 
-## 13) Example session
+## 14) Example session
 
 ```text
 > PING
 < CDC:PONG
 
 > STATUS
-< CDC:STATUS sd=1 usb=1 macros=5 active=0
+< CDC:STATUS sd=1 usb=1 macros=5 radial=2 active=0 events=1 proto=3
 
 > PUT /icon_0_0.bin 14450
 < CDC:READY PUT /icon_0_0.bin 14450

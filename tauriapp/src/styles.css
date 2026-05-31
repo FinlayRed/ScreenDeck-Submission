@@ -396,6 +396,21 @@ button.danger:hover {
   font-family: "DM Mono", monospace;
 }
 
+.radial-badge {
+  position: absolute;
+  left: 4px;
+  bottom: 3px;
+  min-width: 16px;
+  height: 16px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.52rem;
+  font-family: "DM Mono", monospace;
+}
+
 .editor-pane {
   padding: 0.85rem;
   display: grid;
@@ -438,6 +453,102 @@ button.danger:hover {
 .preview-placeholder {
   color: var(--text-dim);
   font-size: 0.65rem;
+}
+
+.radial-panel {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.radial-enable {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text);
+  font-size: 0.75rem;
+}
+
+.radial-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 54px);
+  grid-template-rows: repeat(3, 54px);
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.radial-slot,
+.radial-center {
+  width: 54px;
+  height: 54px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  padding: 0;
+  color: var(--text-dim);
+  font-family: "DM Mono", monospace;
+  font-size: 0.62rem;
+}
+
+.radial-slot {
+  cursor: pointer;
+}
+
+.radial-slot:hover {
+  border-color: var(--line-strong);
+  background: #ebebe6;
+}
+
+.radial-slot.selected {
+  border-color: var(--accent);
+  background: var(--ok-bg);
+}
+
+.radial-slot.configured::after {
+  content: "";
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  right: 4px;
+  top: 4px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.radial-slot {
+  position: relative;
+}
+
+.radial-slot img,
+.radial-center img,
+.radial-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  image-rendering: pixelated;
+}
+
+.radial-center {
+  background: var(--line);
+}
+
+.radial-selected-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.radial-selected-head h3 {
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.radial-preview {
+  width: 72px;
+  height: 72px;
 }
 
 .button-row {

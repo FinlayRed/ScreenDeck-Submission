@@ -8,8 +8,10 @@ const GRID_SIZE = GRID_ROWS * GRID_COLS;
 const ICON_SIZE = 85;
 const ICON_BYTE_SIZE = ICON_SIZE * ICON_SIZE * 2;
 const MAX_ACTIONS_PER_ICON = 24;
+const RADIAL_DIRECTIONS = ["n", "ne", "e", "se", "s", "sw", "w", "nw"] as const;
 
 type Mod = "CTRL" | "SHIFT" | "ALT" | "GUI";
+type RadialDirection = typeof RADIAL_DIRECTIONS[number];
 
 type ComboAction = {
   type: "combo";
@@ -33,12 +35,23 @@ type HostCommandAction = {
   runDetached: boolean;
 };
 
+type RadialItem = {
+  direction: RadialDirection;
+  actions: MacroAction[];
+  hostActions: HostCommandAction[];
+  previewDataUrl: string | null;
+  imageBytes: number[] | null;
+  imageDirty: boolean;
+};
+
 type IconSlot = {
   index: number;
   row: number;
   col: number;
   actions: MacroAction[];
   hostActions: HostCommandAction[];
+  radialEnabled: boolean;
+  radialItems: RadialItem[];
   previewDataUrl: string | null;
   imageBytes: number[] | null;
   imageDirty: boolean;
@@ -49,6 +62,7 @@ type IconUpload = {
   index: number;
   row: number;
   col: number;
+  direction: RadialDirection | null;
   bytes: number[];
 };
 
@@ -83,6 +97,7 @@ type SyncFromDevicePayload = {
 type IconDownload = {
   row: number;
   col: number;
+  direction?: RadialDirection | null;
   bytes: number[];
 };
 
@@ -123,6 +138,7 @@ type DeviceButtonEvent = {
   index: number;
   row: number;
   col: number;
+  direction?: RadialDirection | null;
 };
 
 type MacroJsonDoc = {
@@ -137,6 +153,14 @@ type MacroJsonDoc = {
     col: number;
     actions: MacroAction[];
     hostActions?: HostCommandAction[];
+    radial?: {
+      enabled: boolean;
+      items: Array<{
+        direction: RadialDirection;
+        actions: MacroAction[];
+        hostActions?: HostCommandAction[];
+      }>;
+    };
   }>;
 };
 
@@ -162,7 +186,9 @@ type AppState = {
   macrosDirty: boolean;
   error: string | null;
   newActionDraft: NewActionDraft | null;
-  editorTab: "keys" | "script";
+  editorTab: "keys" | "script" | "radial";
+  radialEditorTab: "keys" | "script";
+  selectedRadialDirection: RadialDirection;
 };
 
 function mustGetAppRoot(): HTMLDivElement {
@@ -191,7 +217,20 @@ const state: AppState = {
   error: null,
   newActionDraft: null,
   editorTab: "keys",
+  radialEditorTab: "keys",
+  selectedRadialDirection: "n",
 };
+
+function createDefaultRadialItems(): RadialItem[] {
+  return RADIAL_DIRECTIONS.map((direction) => ({
+    direction,
+    actions: [],
+    hostActions: [],
+    previewDataUrl: null,
+    imageBytes: null,
+    imageDirty: false,
+  }));
+}
 
 function createDefaultIcons(): IconSlot[] {
   const result: IconSlot[] = [];
@@ -203,6 +242,8 @@ function createDefaultIcons(): IconSlot[] {
       col: index % GRID_COLS,
       actions: [],
       hostActions: [],
+      radialEnabled: false,
+      radialItems: createDefaultRadialItems(),
       previewDataUrl: null,
       imageBytes: null,
       imageDirty: false,
@@ -217,13 +258,25 @@ function selectedIcon(): IconSlot {
   return state.icons[state.selectedIndex];
 }
 
+function selectedRadialItem(): RadialItem {
+  const icon = selectedIcon();
+  return icon.radialItems.find((item) => item.direction === state.selectedRadialDirection)
+    ?? icon.radialItems[0];
+}
+
 function hasPendingChanges(): boolean {
-  const hasImageChanges = state.icons.some((icon) => icon.imageDirty);
+  const hasImageChanges = state.icons.some((icon) =>
+    icon.imageDirty || icon.radialItems.some((item) => item.imageDirty)
+  );
   return hasImageChanges || state.macrosDirty;
 }
 
+function iconHasPendingChanges(icon: IconSlot): boolean {
+  return icon.imageDirty || icon.macroDirty || icon.radialItems.some((item) => item.imageDirty);
+}
+
 function iconDirtyCount(): number {
-  return state.icons.filter((icon) => icon.imageDirty || icon.macroDirty).length;
+  return state.icons.filter((icon) => iconHasPendingChanges(icon)).length;
 }
 
 function isPortResponsive(portName: string): boolean {
@@ -255,6 +308,21 @@ function normalizeModifier(value: string): Mod | null {
     return "GUI";
   }
   return null;
+}
+
+function normalizeRadialDirection(value: unknown): RadialDirection | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return (RADIAL_DIRECTIONS as readonly string[]).includes(normalized)
+    ? normalized as RadialDirection
+    : null;
+}
+
+function radialDirectionLabel(direction: RadialDirection): string {
+  return direction.toUpperCase();
 }
 
 function normalizeAction(raw: unknown): MacroAction | null {
@@ -359,18 +427,36 @@ function clamp(value: number, min: number, max: number): number {
 
 function buildMacroDocument(): MacroJsonDoc {
   return {
-    version: 1,
+    version: 2,
     grid: {
       rows: GRID_ROWS,
       cols: GRID_COLS,
     },
-    icons: state.icons.map((icon) => ({
-      index: icon.index,
-      row: icon.row,
-      col: icon.col,
-      actions: icon.actions,
-      hostActions: icon.hostActions,
-    })),
+    icons: state.icons.map((icon) => {
+      const radialItems = icon.radialItems
+        .filter((item) => item.actions.length > 0 || item.hostActions.length > 0)
+        .map((item) => ({
+          direction: item.direction,
+          actions: item.actions,
+          hostActions: item.hostActions,
+        }));
+
+      return {
+        index: icon.index,
+        row: icon.row,
+        col: icon.col,
+        actions: icon.actions,
+        hostActions: icon.hostActions,
+        ...(icon.radialEnabled
+          ? {
+            radial: {
+              enabled: true,
+              items: radialItems,
+            },
+          }
+          : {}),
+      };
+    }),
   };
 }
 
@@ -386,6 +472,10 @@ function applyMacroDocument(doc: unknown, markDirty = true): void {
 
   const nextActions: MacroAction[][] = Array.from({ length: GRID_SIZE }, () => []);
   const nextHostActions: HostCommandAction[][] = Array.from({ length: GRID_SIZE }, () => []);
+  const nextRadialEnabled: boolean[] = Array.from({ length: GRID_SIZE }, () => false);
+  const nextRadialItems: RadialItem[][] = Array.from({ length: GRID_SIZE }, () =>
+    createDefaultRadialItems()
+  );
 
   for (const entry of iconsRaw) {
     if (typeof entry !== "object" || entry === null) {
@@ -419,6 +509,7 @@ function applyMacroDocument(doc: unknown, markDirty = true): void {
     }
 
     const hostActionsRaw = (entry as { hostActions?: unknown }).hostActions;
+    const radialRaw = (entry as { radial?: unknown }).radial;
 
     const parsed: MacroAction[] = [];
     for (const actionRaw of actionsRaw) {
@@ -443,12 +534,74 @@ function applyMacroDocument(doc: unknown, markDirty = true): void {
     }
 
     nextActions[index] = parsed;
+
+    if (typeof radialRaw === "object" && radialRaw !== null) {
+      const enabledRaw = (radialRaw as { enabled?: unknown }).enabled;
+      nextRadialEnabled[index] = Boolean(enabledRaw);
+      const itemsRaw = (radialRaw as { items?: unknown }).items;
+      if (Array.isArray(itemsRaw)) {
+        const radialItems = createDefaultRadialItems();
+        for (const itemRaw of itemsRaw) {
+          if (typeof itemRaw !== "object" || itemRaw === null) {
+            continue;
+          }
+
+          const direction = normalizeRadialDirection((itemRaw as { direction?: unknown }).direction);
+          if (!direction) {
+            continue;
+          }
+
+          const radialItem = radialItems.find((item) => item.direction === direction);
+          if (!radialItem) {
+            continue;
+          }
+
+          const radialActionsRaw = (itemRaw as { actions?: unknown }).actions;
+          if (Array.isArray(radialActionsRaw)) {
+            const radialActions: MacroAction[] = [];
+            for (const actionRaw of radialActionsRaw) {
+              const action = normalizeAction(actionRaw);
+              if (action) {
+                radialActions.push(action);
+              }
+              if (radialActions.length >= MAX_ACTIONS_PER_ICON) {
+                break;
+              }
+            }
+            radialItem.actions = radialActions;
+          }
+
+          const radialHostActionsRaw = (itemRaw as { hostActions?: unknown }).hostActions;
+          if (Array.isArray(radialHostActionsRaw)) {
+            const radialHostActions: HostCommandAction[] = [];
+            for (const hostActionRaw of radialHostActionsRaw) {
+              const hostAction = normalizeHostAction(hostActionRaw);
+              if (hostAction) {
+                radialHostActions.push(hostAction);
+              }
+            }
+            radialItem.hostActions = radialHostActions;
+          }
+        }
+        nextRadialItems[index] = radialItems;
+      }
+    }
   }
 
   state.icons = state.icons.map((icon) => ({
     ...icon,
     actions: nextActions[icon.index],
     hostActions: nextHostActions[icon.index],
+    radialEnabled: nextRadialEnabled[icon.index],
+    radialItems: nextRadialItems[icon.index].map((item) => {
+      const previous = icon.radialItems.find((existing) => existing.direction === item.direction);
+      return {
+        ...item,
+        previewDataUrl: previous?.previewDataUrl ?? null,
+        imageBytes: null,
+        imageDirty: false,
+      };
+    }),
     macroDirty: markDirty,
   }));
   state.macrosDirty = markDirty;
@@ -529,6 +682,22 @@ function multilineToHostArgs(value: string): string[] {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
+}
+
+function currentActionTarget(): { actions: MacroAction[]; ownerIndex: number } {
+  if (state.editorTab === "radial" && state.radialEditorTab === "keys") {
+    return { actions: selectedRadialItem().actions, ownerIndex: selectedIcon().index };
+  }
+
+  return { actions: selectedIcon().actions, ownerIndex: selectedIcon().index };
+}
+
+function currentHostActionTarget(): { hostActions: HostCommandAction[]; ownerIndex: number } {
+  if (state.editorTab === "radial" && state.radialEditorTab === "script") {
+    return { hostActions: selectedRadialItem().hostActions, ownerIndex: selectedIcon().index };
+  }
+
+  return { hostActions: selectedIcon().hostActions, ownerIndex: selectedIcon().index };
 }
 
 function companionStatusLabel(): string {
@@ -627,7 +796,10 @@ async function setupCompanionListeners(): Promise<void> {
   });
 
   await listen<DeviceButtonEvent>("device-button-event", (event) => {
-    appendLog(`Deck button ${event.payload.index} pressed (${event.payload.row},${event.payload.col})`);
+    const direction = event.payload.direction;
+    appendLog(direction
+      ? `Deck radial ${event.payload.index}/${direction} released (${event.payload.row},${event.payload.col})`
+      : `Deck button ${event.payload.index} pressed (${event.payload.row},${event.payload.col})`);
     render();
   });
 }
@@ -643,7 +815,10 @@ function escapeHtml(value: string): string {
 
 function iconCardMarkup(icon: IconSlot): string {
   const isSelected = icon.index === state.selectedIndex;
-  const dirty = icon.imageDirty || icon.macroDirty;
+  const dirty = iconHasPendingChanges(icon);
+  const radialCount = icon.radialItems.filter((item) =>
+    item.actions.length > 0 || item.hostActions.length > 0
+  ).length;
   const classes = ["icon-card"];
   if (isSelected) classes.push("selected");
   if (dirty) classes.push("dirty");
@@ -656,6 +831,7 @@ function iconCardMarkup(icon: IconSlot): string {
     <button class="${classes.join(" ")}" data-icon-index="${icon.index}">
       ${body}
       <span class="icon-index">#${icon.index}</span>
+      ${icon.radialEnabled ? `<span class="radial-badge">${radialCount}</span>` : ""}
     </button>
   `;
 }
@@ -723,6 +899,134 @@ function hostActionMarkup(action: HostCommandAction, actionIndex: number): strin
         Arguments (one per line)
         <textarea class="host-action-args" data-host-action-index="${actionIndex}" rows="4" placeholder="C:\\scripts\\spotify_next.py">${escapeHtml(hostArgsToMultiline(action.args))}</textarea>
       </label>
+    </div>
+  `;
+}
+
+function newActionFormMarkup(): string {
+  if (state.newActionDraft === null) {
+    return "";
+  }
+
+  return `
+    <div class="new-action-form">
+      <div class="new-action-row">
+        <select id="newActionType">
+          <option value="combo" ${state.newActionDraft.type === "combo" ? "selected" : ""}>combo</option>
+          <option value="delay" ${state.newActionDraft.type === "delay" ? "selected" : ""}>delay</option>
+        </select>
+        ${state.newActionDraft.type === "combo" ? `
+          <input id="newActionKey" class="action-key" value="${escapeHtml(state.newActionDraft.key)}" maxlength="16" placeholder="Key (A, ENTER, F13)" />
+        ` : `
+          <label class="delay-label">ms</label>
+          <input id="newActionMs" class="action-delay" type="number" min="0" max="60000" value="${state.newActionDraft.ms}" />
+        `}
+      </div>
+      ${state.newActionDraft.type === "combo" ? `
+      <div class="new-action-mods">
+        <label><input type="checkbox" id="newModCTRL" ${state.newActionDraft.mods.includes("CTRL") ? "checked" : ""} />Ctrl</label>
+        <label><input type="checkbox" id="newModSHIFT" ${state.newActionDraft.mods.includes("SHIFT") ? "checked" : ""} />Shift</label>
+        <label><input type="checkbox" id="newModALT" ${state.newActionDraft.mods.includes("ALT") ? "checked" : ""} />Alt</label>
+        <label><input type="checkbox" id="newModGUI" ${state.newActionDraft.mods.includes("GUI") ? "checked" : ""} />Gui</label>
+      </div>
+      ` : ""}
+      <div class="button-row">
+        <button id="confirmAddCommandBtn" class="primary small">Add to sequence</button>
+        <button id="cancelAddCommandBtn" class="secondary small">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+function keyEditorMarkup(title: string, actions: MacroAction[]): string {
+  return `
+    <div class="section-heading">
+      <h3>${escapeHtml(title)} <span class="action-count">${actions.length}/${MAX_ACTIONS_PER_ICON}</span></h3>
+      <button id="addCommandBtn" class="secondary small" ${actions.length >= MAX_ACTIONS_PER_ICON || state.newActionDraft !== null ? "disabled" : ""}>+ Add command</button>
+    </div>
+
+    ${newActionFormMarkup()}
+
+    <div class="actions-list">
+      ${actions.length === 0 ? `<div class="empty-state">No actions configured.</div>` : actions.map((action, i) => actionMarkup(action, i)).join("")}
+    </div>
+  `;
+}
+
+function scriptEditorMarkup(title: string, hostActions: HostCommandAction[]): string {
+  return `
+    <div class="section-heading">
+      <div>
+        <h3>${escapeHtml(title)}</h3>
+        <p>Run a program or script via the desktop companion.</p>
+      </div>
+      <button id="addHostActionBtn" class="secondary small">+ Add script</button>
+    </div>
+
+    <div class="host-actions-list">
+      ${hostActions.length === 0 ? `<div class="empty-state">No scripts configured.</div>` : hostActions.map((action, i) => hostActionMarkup(action, i)).join("")}
+    </div>
+  `;
+}
+
+function radialDirectionGridMarkup(icon: IconSlot): string {
+  const cells: Array<RadialDirection | "center"> = ["nw", "n", "ne", "w", "center", "e", "sw", "s", "se"];
+
+  return `
+    <div class="radial-grid">
+      ${cells.map((cell) => {
+        if (cell === "center") {
+          return `<div class="radial-center">${icon.previewDataUrl ? `<img src="${icon.previewDataUrl}" alt="Center icon" />` : ""}</div>`;
+        }
+
+        const item = icon.radialItems.find((entry) => entry.direction === cell);
+        const configured = !!item && (item.actions.length > 0 || item.hostActions.length > 0);
+        const selected = cell === state.selectedRadialDirection;
+        return `
+          <button class="radial-slot ${selected ? "selected" : ""} ${configured ? "configured" : ""}" data-radial-direction="${cell}">
+            ${item?.previewDataUrl ? `<img src="${item.previewDataUrl}" alt="${cell} radial icon" />` : `<span>${radialDirectionLabel(cell)}</span>`}
+          </button>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function radialEditorMarkup(icon: IconSlot): string {
+  const item = selectedRadialItem();
+
+  return `
+    <div class="radial-panel">
+      <label class="radial-enable">
+        <input id="radialEnabledInput" type="checkbox" ${icon.radialEnabled ? "checked" : ""} />
+        Enable radial menu
+      </label>
+
+      ${radialDirectionGridMarkup(icon)}
+
+      <div class="radial-selected-head">
+        <h3>${radialDirectionLabel(item.direction)} Slot</h3>
+        <span class="action-count">${item.actions.length + item.hostActions.length} configured</span>
+      </div>
+
+      <div class="preview-box radial-preview">
+        ${item.previewDataUrl ? `<img src="${item.previewDataUrl}" alt="Radial icon preview" />` : `<div class="preview-placeholder">${radialDirectionLabel(item.direction)}</div>`}
+      </div>
+
+      <div class="button-row">
+        <button id="pickRadialImageBtn" class="secondary">Choose Radial Image</button>
+        <button id="clearRadialImageBtn" class="secondary" ${item.imageBytes || item.previewDataUrl ? "" : "disabled"}>Clear Radial Image</button>
+      </div>
+      <input id="radialFileInput" type="file" accept="image/*" hidden />
+
+      <div class="mode-tabs compact">
+        <button id="radialTabKeysBtn" class="tab-btn ${state.radialEditorTab === "keys" ? "active" : ""}">Key Sequence</button>
+        <button id="radialTabScriptBtn" class="tab-btn ${state.radialEditorTab === "script" ? "active" : ""}">Execute Script</button>
+      </div>
+
+      ${state.radialEditorTab === "keys"
+        ? keyEditorMarkup("Radial Key Sequence", item.actions)
+        : scriptEditorMarkup("Radial Script", item.hostActions)}
     </div>
   `;
 }
@@ -829,59 +1133,14 @@ function render(): void {
           <div class="mode-tabs">
             <button id="tabKeysBtn" class="tab-btn ${state.editorTab === "keys" ? "active" : ""}">Key Sequence</button>
             <button id="tabScriptBtn" class="tab-btn ${state.editorTab === "script" ? "active" : ""}">Execute Script</button>
+            <button id="tabRadialBtn" class="tab-btn ${state.editorTab === "radial" ? "active" : ""}">Radial Menu</button>
           </div>
 
-          ${state.editorTab === "keys" ? `
-          <div class="section-heading">
-            <h3>Key Sequence <span class="action-count">${icon.actions.length}/${MAX_ACTIONS_PER_ICON}</span></h3>
-            <button id="addCommandBtn" class="secondary small" ${icon.actions.length >= MAX_ACTIONS_PER_ICON || state.newActionDraft !== null ? "disabled" : ""}>+ Add command</button>
-          </div>
-
-          ${state.newActionDraft !== null ? `
-          <div class="new-action-form">
-            <div class="new-action-row">
-              <select id="newActionType">
-                <option value="combo" ${state.newActionDraft.type === "combo" ? "selected" : ""}>combo</option>
-                <option value="delay" ${state.newActionDraft.type === "delay" ? "selected" : ""}>delay</option>
-              </select>
-              ${state.newActionDraft.type === "combo" ? `
-                <input id="newActionKey" class="action-key" value="${escapeHtml(state.newActionDraft.key)}" maxlength="16" placeholder="Key (A, ENTER, F13)" />
-              ` : `
-                <label class="delay-label">ms</label>
-                <input id="newActionMs" class="action-delay" type="number" min="0" max="60000" value="${state.newActionDraft.ms}" />
-              `}
-            </div>
-            ${state.newActionDraft.type === "combo" ? `
-            <div class="new-action-mods">
-              <label><input type="checkbox" id="newModCTRL" ${state.newActionDraft.mods.includes("CTRL") ? "checked" : ""} />Ctrl</label>
-              <label><input type="checkbox" id="newModSHIFT" ${state.newActionDraft.mods.includes("SHIFT") ? "checked" : ""} />Shift</label>
-              <label><input type="checkbox" id="newModALT" ${state.newActionDraft.mods.includes("ALT") ? "checked" : ""} />Alt</label>
-              <label><input type="checkbox" id="newModGUI" ${state.newActionDraft.mods.includes("GUI") ? "checked" : ""} />Gui</label>
-            </div>
-            ` : ""}
-            <div class="button-row">
-              <button id="confirmAddCommandBtn" class="primary small">Add to sequence</button>
-              <button id="cancelAddCommandBtn" class="secondary small">Cancel</button>
-            </div>
-          </div>
-          ` : ""}
-
-          <div class="actions-list">
-            ${icon.actions.length === 0 ? `<div class="empty-state">No actions configured.</div>` : icon.actions.map((action, i) => actionMarkup(action, i)).join("")}
-          </div>
-          ` : `
-          <div class="section-heading">
-            <div>
-              <h3>Execute Script</h3>
-              <p>Run a program or script via the desktop companion.</p>
-            </div>
-            <button id="addHostActionBtn" class="secondary small">+ Add script</button>
-          </div>
-
-          <div class="host-actions-list">
-            ${icon.hostActions.length === 0 ? `<div class="empty-state">No scripts configured.</div>` : icon.hostActions.map((action, i) => hostActionMarkup(action, i)).join("")}
-          </div>
-          `}
+          ${state.editorTab === "keys"
+            ? keyEditorMarkup("Key Sequence", icon.actions)
+            : state.editorTab === "script"
+              ? scriptEditorMarkup("Execute Script", icon.hostActions)
+              : radialEditorMarkup(icon)}
         </div>
       </section>
 
@@ -912,6 +1171,8 @@ function bindEvents(): void {
       state.error = null;
       state.newActionDraft = null;
       state.editorTab = "keys";
+      state.radialEditorTab = "keys";
+      state.selectedRadialDirection = "n";
       render();
     });
   });
@@ -1001,10 +1262,88 @@ function bindEvents(): void {
     render();
   });
 
+  const tabRadialBtn = app.querySelector<HTMLButtonElement>("#tabRadialBtn");
+  tabRadialBtn?.addEventListener("click", () => {
+    state.editorTab = "radial";
+    state.newActionDraft = null;
+    render();
+  });
+
+  const radialEnabledInput = app.querySelector<HTMLInputElement>("#radialEnabledInput");
+  radialEnabledInput?.addEventListener("change", () => {
+    const icon = selectedIcon();
+    icon.radialEnabled = radialEnabledInput.checked;
+    markMacroDirty(icon.index);
+    render();
+  });
+
+  app.querySelectorAll<HTMLButtonElement>(".radial-slot").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const direction = normalizeRadialDirection(btn.dataset.radialDirection);
+      if (!direction) return;
+      state.selectedRadialDirection = direction;
+      state.newActionDraft = null;
+      render();
+    });
+  });
+
+  const radialTabKeysBtn = app.querySelector<HTMLButtonElement>("#radialTabKeysBtn");
+  radialTabKeysBtn?.addEventListener("click", () => {
+    state.radialEditorTab = "keys";
+    state.newActionDraft = null;
+    render();
+  });
+
+  const radialTabScriptBtn = app.querySelector<HTMLButtonElement>("#radialTabScriptBtn");
+  radialTabScriptBtn?.addEventListener("click", () => {
+    state.radialEditorTab = "script";
+    state.newActionDraft = null;
+    render();
+  });
+
+  const pickRadialImageBtn = app.querySelector<HTMLButtonElement>("#pickRadialImageBtn");
+  const radialFileInput = app.querySelector<HTMLInputElement>("#radialFileInput");
+  pickRadialImageBtn?.addEventListener("click", () => {
+    radialFileInput?.click();
+  });
+
+  radialFileInput?.addEventListener("change", async () => {
+    const file = radialFileInput.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    try {
+      const converted = await convertImageToRgb565(file);
+      const icon = selectedIcon();
+      const item = selectedRadialItem();
+      item.previewDataUrl = converted.previewDataUrl;
+      item.imageBytes = converted.bytes;
+      item.imageDirty = true;
+      appendLog(`Prepared radial_${icon.row}_${icon.col}_${item.direction}.bin (${converted.bytes.length} bytes)`);
+      state.error = null;
+    } catch (error) {
+      state.error = `Radial image conversion failed: ${String(error)}`;
+      appendLog(state.error);
+    }
+
+    radialFileInput.value = "";
+    render();
+  });
+
+  const clearRadialImageBtn = app.querySelector<HTMLButtonElement>("#clearRadialImageBtn");
+  clearRadialImageBtn?.addEventListener("click", () => {
+    const item = selectedRadialItem();
+    item.imageBytes = null;
+    item.imageDirty = false;
+    item.previewDataUrl = null;
+    render();
+  });
+
   const addCommandBtn = app.querySelector<HTMLButtonElement>("#addCommandBtn");
   addCommandBtn?.addEventListener("click", () => {
-    const icon = selectedIcon();
-    if (icon.actions.length >= MAX_ACTIONS_PER_ICON) return;
+    const target = currentActionTarget();
+    if (target.actions.length >= MAX_ACTIONS_PER_ICON) return;
     state.newActionDraft = { type: "combo", key: "A", mods: [], ms: 120 };
     render();
   });
@@ -1044,8 +1383,8 @@ function bindEvents(): void {
 
   const confirmAddCommandBtn = app.querySelector<HTMLButtonElement>("#confirmAddCommandBtn");
   confirmAddCommandBtn?.addEventListener("click", () => {
-    const icon = selectedIcon();
-    if (!state.newActionDraft || icon.actions.length >= MAX_ACTIONS_PER_ICON) return;
+    const target = currentActionTarget();
+    if (!state.newActionDraft || target.actions.length >= MAX_ACTIONS_PER_ICON) return;
     const draft = state.newActionDraft;
     let action: MacroAction;
     if (draft.type === "combo") {
@@ -1053,8 +1392,8 @@ function bindEvents(): void {
     } else {
       action = { type: "delay", ms: draft.ms };
     }
-    icon.actions.push(action);
-    markMacroDirty(icon.index);
+    target.actions.push(action);
+    markMacroDirty(target.ownerIndex);
     state.newActionDraft = null;
     render();
   });
@@ -1067,41 +1406,41 @@ function bindEvents(): void {
 
   app.querySelectorAll<HTMLButtonElement>(".remove-action").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const icon = selectedIcon();
+      const target = currentActionTarget();
       const idx = Number(btn.dataset.actionIndex);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= icon.actions.length) {
+      if (!Number.isInteger(idx) || idx < 0 || idx >= target.actions.length) {
         return;
       }
-      icon.actions.splice(idx, 1);
-      markMacroDirty(icon.index);
+      target.actions.splice(idx, 1);
+      markMacroDirty(target.ownerIndex);
       render();
     });
   });
 
   app.querySelectorAll<HTMLSelectElement>(".action-type").forEach((select) => {
     select.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentActionTarget();
       const idx = Number(select.dataset.actionIndex);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= icon.actions.length) {
+      if (!Number.isInteger(idx) || idx < 0 || idx >= target.actions.length) {
         return;
       }
 
       if (select.value === "combo") {
-        icon.actions[idx] = { type: "combo", key: "A", mods: [] };
+        target.actions[idx] = { type: "combo", key: "A", mods: [] };
       } else {
-        icon.actions[idx] = { type: "delay", ms: 120 };
+        target.actions[idx] = { type: "delay", ms: 120 };
       }
 
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
       render();
     });
   });
 
   app.querySelectorAll<HTMLInputElement>(".action-key").forEach((input) => {
     input.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentActionTarget();
       const idx = Number(input.dataset.actionIndex);
-      const action = icon.actions[idx];
+      const action = target.actions[idx];
       if (!action || action.type !== "combo") {
         return;
       }
@@ -1110,17 +1449,17 @@ function bindEvents(): void {
       if (!action.key) {
         action.key = "A";
       }
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
       render();
     });
   });
 
   app.querySelectorAll<HTMLInputElement>(".mod-toggle").forEach((checkbox) => {
     checkbox.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentActionTarget();
       const idx = Number(checkbox.dataset.actionIndex);
       const mod = checkbox.dataset.mod as Mod | undefined;
-      const action = icon.actions[idx];
+      const action = target.actions[idx];
 
       if (!action || action.type !== "combo" || !mod) {
         return;
@@ -1133,29 +1472,29 @@ function bindEvents(): void {
         nextMods.delete(mod);
       }
       action.mods = Array.from(nextMods);
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
     });
   });
 
   app.querySelectorAll<HTMLInputElement>(".action-delay").forEach((input) => {
     input.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentActionTarget();
       const idx = Number(input.dataset.actionIndex);
-      const action = icon.actions[idx];
+      const action = target.actions[idx];
       if (!action || action.type !== "delay") {
         return;
       }
 
       action.ms = clamp(Number(input.value) || 0, 0, 60000);
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
       render();
     });
   });
 
   const addHostActionBtn = app.querySelector<HTMLButtonElement>("#addHostActionBtn");
   addHostActionBtn?.addEventListener("click", () => {
-    const icon = selectedIcon();
-    icon.hostActions.push({
+    const target = currentHostActionTarget();
+    target.hostActions.push({
       type: "command",
       label: "",
       program: "",
@@ -1163,92 +1502,92 @@ function bindEvents(): void {
       cwd: null,
       runDetached: false,
     });
-    markMacroDirty(icon.index);
+    markMacroDirty(target.ownerIndex);
     render();
   });
 
   app.querySelectorAll<HTMLButtonElement>(".remove-host-action").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const icon = selectedIcon();
+      const target = currentHostActionTarget();
       const idx = Number(btn.dataset.hostActionIndex);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= icon.hostActions.length) {
+      if (!Number.isInteger(idx) || idx < 0 || idx >= target.hostActions.length) {
         return;
       }
 
-      icon.hostActions.splice(idx, 1);
-      markMacroDirty(icon.index);
+      target.hostActions.splice(idx, 1);
+      markMacroDirty(target.ownerIndex);
       render();
     });
   });
 
   app.querySelectorAll<HTMLInputElement>(".host-action-label").forEach((input) => {
     input.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentHostActionTarget();
       const idx = Number(input.dataset.hostActionIndex);
-      const action = icon.hostActions[idx];
+      const action = target.hostActions[idx];
       if (!action) {
         return;
       }
 
       action.label = input.value.trim();
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
     });
   });
 
   app.querySelectorAll<HTMLInputElement>(".host-action-program").forEach((input) => {
     input.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentHostActionTarget();
       const idx = Number(input.dataset.hostActionIndex);
-      const action = icon.hostActions[idx];
+      const action = target.hostActions[idx];
       if (!action) {
         return;
       }
 
       action.program = input.value.trim();
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
     });
   });
 
   app.querySelectorAll<HTMLInputElement>(".host-action-cwd").forEach((input) => {
     input.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentHostActionTarget();
       const idx = Number(input.dataset.hostActionIndex);
-      const action = icon.hostActions[idx];
+      const action = target.hostActions[idx];
       if (!action) {
         return;
       }
 
       const trimmed = input.value.trim();
       action.cwd = trimmed ? trimmed : null;
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
     });
   });
 
   app.querySelectorAll<HTMLInputElement>(".host-action-detached").forEach((input) => {
     input.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentHostActionTarget();
       const idx = Number(input.dataset.hostActionIndex);
-      const action = icon.hostActions[idx];
+      const action = target.hostActions[idx];
       if (!action) {
         return;
       }
 
       action.runDetached = input.checked;
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
     });
   });
 
   app.querySelectorAll<HTMLTextAreaElement>(".host-action-args").forEach((input) => {
     input.addEventListener("change", () => {
-      const icon = selectedIcon();
+      const target = currentHostActionTarget();
       const idx = Number(input.dataset.hostActionIndex);
-      const action = icon.hostActions[idx];
+      const action = target.hostActions[idx];
       if (!action) {
         return;
       }
 
       action.args = multilineToHostArgs(input.value);
-      markMacroDirty(icon.index);
+      markMacroDirty(target.ownerIndex);
     });
   });
 
@@ -1443,12 +1782,28 @@ async function sendChanges(): Promise<void> {
       index: icon.index,
       row: icon.row,
       col: icon.col,
+      direction: null,
       bytes: icon.imageBytes ?? [],
     }));
 
+  for (const icon of state.icons) {
+    for (const item of icon.radialItems) {
+      if (item.imageDirty && item.imageBytes !== null) {
+        iconUploads.push({
+          index: icon.index,
+          row: icon.row,
+          col: icon.col,
+          direction: item.direction,
+          bytes: item.imageBytes,
+        });
+      }
+    }
+  }
+
   for (const icon of iconUploads) {
     if (icon.bytes.length !== ICON_BYTE_SIZE) {
-      state.error = `Icon ${icon.index} has invalid byte size (${icon.bytes.length}).`;
+      const label = icon.direction ? `Radial ${icon.index}/${icon.direction}` : `Icon ${icon.index}`;
+      state.error = `${label} has invalid byte size (${icon.bytes.length}).`;
       render();
       return;
     }
@@ -1493,6 +1848,11 @@ async function sendChanges(): Promise<void> {
     for (const icon of state.icons) {
       if (icon.imageDirty) {
         icon.imageDirty = false;
+      }
+      for (const item of icon.radialItems) {
+        if (item.imageDirty) {
+          item.imageDirty = false;
+        }
       }
     }
 
@@ -1591,10 +1951,15 @@ async function syncFromDevice(): Promise<void> {
     applyMacroDocument(macroDoc, false);
 
     const iconMap = new Map<number, number[]>();
+    const radialIconMap = new Map<string, number[]>();
     for (const icon of result.iconDownloads) {
       const index = icon.row * GRID_COLS + icon.col;
       if (index >= 0 && index < GRID_SIZE && icon.bytes.length === ICON_BYTE_SIZE) {
-        iconMap.set(index, icon.bytes);
+        if (icon.direction) {
+          radialIconMap.set(`${index}:${icon.direction}`, icon.bytes);
+        } else {
+          iconMap.set(index, icon.bytes);
+        }
       }
     }
 
@@ -1612,6 +1977,19 @@ async function syncFromDevice(): Promise<void> {
         previewDataUrl,
         imageBytes: null,
         imageDirty: false,
+        radialItems: icon.radialItems.map((item) => {
+          const radialBytes = radialIconMap.get(`${icon.index}:${item.direction}`) ?? null;
+          return {
+            ...item,
+            previewDataUrl: radialBytes
+              ? rgb565BytesToPreviewDataUrl(radialBytes)
+              : item.actions.length > 0 || item.hostActions.length > 0
+                ? fallbackPreview
+                : null,
+            imageBytes: null,
+            imageDirty: false,
+          };
+        }),
       };
     });
 
