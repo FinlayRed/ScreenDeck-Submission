@@ -273,6 +273,7 @@ struct RadialMenuState {
   lv_point_t pressPoint = {0, 0};
   bool hasPressPoint = false;
   lv_obj_t* overlay = nullptr;
+  lv_obj_t* sourceButton = nullptr;
   lv_obj_t* itemObjects[RADIAL_DIRECTION_COUNT] = {nullptr};
 };
 
@@ -1668,6 +1669,30 @@ static bool radialDragExceededOpenThreshold(const lv_point_t& point) {
   return max(abs(dx), abs(dy)) >= RADIAL_MENU_OPEN_DRAG_PX;
 }
 
+static void suppressSourceButtonTapFeedback(lv_obj_t* btn) {
+  if (btn == nullptr) {
+    return;
+  }
+
+  lv_anim_del(btn, nullptr);
+  lv_obj_set_style_transform_zoom(btn, LV_IMG_ZOOM_NONE, LV_STATE_PRESSED);
+  lv_obj_clear_state(btn, LV_STATE_PRESSED);
+  lv_obj_invalidate(btn);
+}
+
+static void restoreSourceButtonTapFeedback() {
+  lv_obj_t* btn = g_radialMenu.sourceButton;
+  g_radialMenu.sourceButton = nullptr;
+
+  if (btn == nullptr) {
+    return;
+  }
+
+  lv_obj_clear_state(btn, LV_STATE_PRESSED);
+  lv_obj_remove_local_style_prop(btn, LV_STYLE_TRANSFORM_ZOOM, LV_STATE_PRESSED);
+  lv_obj_invalidate(btn);
+}
+
 static void updateRadialSelection(int selectedDirection) {
   g_radialMenu.selectedDirection = selectedDirection;
 
@@ -1692,6 +1717,8 @@ static void updateRadialSelection(int selectedDirection) {
 }
 
 static void hideRadialMenu() {
+  restoreSourceButtonTapFeedback();
+
   if (g_radialMenu.overlay != nullptr) {
     lv_obj_del(g_radialMenu.overlay);
   }
@@ -1704,10 +1731,11 @@ static void hideRadialMenu() {
   }
 }
 
-static void showRadialMenu(uint8_t iconIndex, int row, int col,
+static void showRadialMenu(uint8_t iconIndex, int row, int col, lv_obj_t* sourceButton,
                            const lv_point_t& origin);
 
-static void maybeOpenRadialMenuFromDrag(uint8_t iconIndex, int row, int col) {
+static void maybeOpenRadialMenuFromDrag(uint8_t iconIndex, int row, int col,
+                                        lv_obj_t* sourceButton) {
   if (g_radialMenu.active || iconIndex >= TOTAL_BUTTONS ||
       !g_iconMacros[iconIndex].radialEnabled) {
     return;
@@ -1718,11 +1746,12 @@ static void maybeOpenRadialMenuFromDrag(uint8_t iconIndex, int row, int col) {
     return;
   }
 
-  showRadialMenu(iconIndex, row, col, g_radialMenu.origin);
+  showRadialMenu(iconIndex, row, col, sourceButton, g_radialMenu.origin);
   updateRadialSelection(radialDirectionFromPoint(point));
 }
 
-static void showRadialMenu(uint8_t iconIndex, int row, int col, const lv_point_t& origin) {
+static void showRadialMenu(uint8_t iconIndex, int row, int col, lv_obj_t* sourceButton,
+                           const lv_point_t& origin) {
   if (iconIndex >= TOTAL_BUTTONS || !g_iconMacros[iconIndex].radialEnabled) {
     return;
   }
@@ -1735,6 +1764,8 @@ static void showRadialMenu(uint8_t iconIndex, int row, int col, const lv_point_t
   g_radialMenu.row = row;
   g_radialMenu.col = col;
   g_radialMenu.origin = origin;
+  g_radialMenu.sourceButton = sourceButton;
+  suppressSourceButtonTapFeedback(g_radialMenu.sourceButton);
 
   lv_obj_t* screen = lv_scr_act();
   g_radialMenu.overlay = lv_obj_create(screen);
@@ -1830,32 +1861,54 @@ static void updateRadialMenuFromTouch() {
   updateRadialSelection(radialDirectionFromPoint(point));
 }
 
+static bool executeRadialDirection(uint8_t iconIndex, int row, int col,
+                                   int selectedDirection) {
+  if (selectedDirection < 0 || selectedDirection >= RADIAL_DIRECTION_COUNT) {
+    return false;
+  }
+
+  if (iconIndex >= TOTAL_BUTTONS) {
+    return false;
+  }
+
+  RadialMacroItem& item = g_iconMacros[iconIndex].radialItems[selectedDirection];
+  if (!item.configured) {
+    return false;
+  }
+
+  const char* directionName = radialDirectionName(selectedDirection);
+  Serial.printf("Radial selected: icon=%u direction=%s\n", iconIndex, directionName);
+  emitRadialEvent(iconIndex, row, col, directionName);
+
+  char label[32];
+  snprintf(label, sizeof(label), "radial %u %s", iconIndex, directionName);
+  queueMacroActions(item.actions, item.actionCount, label);
+  return true;
+}
+
 static void executeRadialMenuSelection() {
   if (!g_radialMenu.active) {
     return;
   }
 
-  int selectedDirection = g_radialMenu.selectedDirection;
-  if (selectedDirection < 0 || selectedDirection >= RADIAL_DIRECTION_COUNT) {
-    return;
+  executeRadialDirection(g_radialMenu.iconIndex, g_radialMenu.row, g_radialMenu.col,
+                         g_radialMenu.selectedDirection);
+}
+
+static bool handleFastRadialRelease(uint8_t iconIndex, int row, int col) {
+  if (iconIndex >= TOTAL_BUTTONS || !g_iconMacros[iconIndex].radialEnabled) {
+    return false;
   }
 
-  RadialMacroItem& item =
-      g_iconMacros[g_radialMenu.iconIndex].radialItems[selectedDirection];
-  if (!item.configured) {
-    return;
+  lv_point_t point;
+  if (!getActivePointerPoint(point) || !radialDragExceededOpenThreshold(point)) {
+    return false;
   }
 
-  const char* directionName = radialDirectionName(selectedDirection);
-  Serial.printf("Radial selected: icon=%u direction=%s\n", g_radialMenu.iconIndex,
-                directionName);
-  emitRadialEvent(g_radialMenu.iconIndex, g_radialMenu.row, g_radialMenu.col,
-                  directionName);
-
-  char label[32];
-  snprintf(label, sizeof(label), "radial %u %s", g_radialMenu.iconIndex,
-           directionName);
-  queueMacroActions(item.actions, item.actionCount, label);
+  int selectedDirection = radialDirectionFromPoint(point);
+  g_radialMenu.suppressNextClick = true;
+  executeRadialDirection(iconIndex, row, col, selectedDirection);
+  return true;
 }
 
 void rebuildGridUI() {
@@ -1869,6 +1922,7 @@ void rebuildGridUI() {
   isScreensaverActive = false;
   g_radialMenu.active = false;
   g_radialMenu.overlay = nullptr;
+  g_radialMenu.sourceButton = nullptr;
   g_radialMenu.selectedDirection = -1;
   for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
     g_radialMenu.itemObjects[direction] = nullptr;
@@ -1897,6 +1951,8 @@ void rebuildGridUI() {
       lv_obj_set_pos(btn, start_x + col * (BUTTON_SIZE + BUTTON_GAP),
                      start_y + row * (BUTTON_SIZE + BUTTON_GAP));
       lv_obj_add_flag(btn, LV_OBJ_FLAG_PRESS_LOCK);
+      lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN |
+                                 LV_OBJ_FLAG_GESTURE_BUBBLE);
       lv_obj_add_style(btn, &g_buttonTapStyleDefault, 0);
       lv_obj_add_style(btn, &g_buttonTapStylePressed, LV_STATE_PRESSED);
 
@@ -1962,20 +2018,18 @@ static void btn_event_handler(lv_event_t* e) {
     if (g_radialMenu.active) {
       updateRadialMenuFromTouch();
     } else if (iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
-      maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col);
+      maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col, btn);
     }
     return;
   }
 
   if (code == LV_EVENT_RELEASED) {
-    if (!g_radialMenu.active && iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
-      maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col);
-    }
-
     if (g_radialMenu.active) {
       updateRadialMenuFromTouch();
       executeRadialMenuSelection();
       hideRadialMenu();
+    } else if (iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
+      handleFastRadialRelease(static_cast<uint8_t>(iconIndex), row, col);
     }
     return;
   }
