@@ -169,6 +169,8 @@ struct HostMacroRadial {
 #[serde(rename_all = "camelCase")]
 struct HostMacroRadialItem {
     direction: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
     #[serde(default)]
     host_actions: Vec<HostCommandAction>,
 }
@@ -361,6 +363,10 @@ fn normalized_radial_direction(direction: &str) -> Option<String> {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn button_action_key(index: u8) -> String {
     format!("button:{index}")
 }
@@ -398,6 +404,10 @@ fn parse_host_actions_document(text: &str) -> Result<HashMap<String, Vec<HostCom
 
         if let Some(radial) = icon.radial.filter(|radial| radial.enabled) {
             for item in radial.items {
+                if !item.enabled {
+                    continue;
+                }
+
                 let Some(direction) = item
                     .direction
                     .as_deref()
@@ -456,6 +466,10 @@ fn collect_radial_icon_downloads(text: &str) -> Vec<(u8, u8, String)> {
         };
 
         for item in radial.items {
+            if !item.enabled {
+                continue;
+            }
+
             if let Some(direction) = item
                 .direction
                 .as_deref()

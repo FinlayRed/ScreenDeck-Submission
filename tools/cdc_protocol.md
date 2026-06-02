@@ -31,7 +31,7 @@ Macro config:
   "radial": {
     "enabled": true,
     "items": [
-      { "direction": "n", "actions": [{ "type": "combo", "key": "A", "mods": [] }], "hostActions": [] }
+      { "direction": "n", "enabled": true, "actions": [{ "type": "combo", "key": "A", "mods": [] }], "hostActions": [] }
     ]
   }
 }

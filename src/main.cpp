@@ -893,6 +893,7 @@ static void loadMacroConfigFromSD() {
             continue;
           }
 
+          bool itemEnabled = item["enabled"] | true;
           RadialMacroItem& radialItem = g_iconMacros[index].radialItems[directionIndex];
           radialItem.actionCount = parseMacroActions(
               item["actions"].as<JsonArrayConst>(), radialItem.actions, "Radial item",
@@ -900,8 +901,17 @@ static void loadMacroConfigFromSD() {
 
           JsonArrayConst hostActions = item["hostActions"].as<JsonArrayConst>();
           radialItem.configured =
-              radialItem.actionCount > 0 ||
-              (!hostActions.isNull() && hostActions.size() > 0);
+              itemEnabled &&
+              (radialItem.actionCount > 0 ||
+               (!hostActions.isNull() && hostActions.size() > 0));
+        }
+      }
+
+      g_iconMacros[index].radialEnabled = false;
+      for (int direction = 0; direction < RADIAL_DIRECTION_COUNT; direction++) {
+        if (g_iconMacros[index].radialItems[direction].configured) {
+          g_iconMacros[index].radialEnabled = true;
+          break;
         }
       }
     }
@@ -1790,7 +1800,10 @@ static void showRadialMenu(uint8_t iconIndex, int row, int col, lv_obj_t* source
       continue;
     }
 
-    bool configured = g_iconMacros[iconIndex].radialItems[direction].configured;
+    if (!g_iconMacros[iconIndex].radialItems[direction].configured) {
+      continue;
+    }
+
     int itemX = menuX + (offsetX + 1) * (BUTTON_SIZE + RADIAL_MENU_GAP);
     int itemY = menuY + (offsetY + 1) * (BUTTON_SIZE + RADIAL_MENU_GAP);
 
@@ -1798,29 +1811,27 @@ static void showRadialMenu(uint8_t iconIndex, int row, int col, lv_obj_t* source
     lv_obj_remove_style_all(item);
     lv_obj_set_size(item, BUTTON_SIZE, BUTTON_SIZE);
     lv_obj_set_pos(item, itemX, itemY);
-    lv_obj_set_style_bg_color(item, lv_color_hex(configured ? 0x101010 : 0x050505), 0);
-    lv_obj_set_style_bg_opa(item, configured ? LV_OPA_COVER : LV_OPA_50, 0);
+    lv_obj_set_style_bg_color(item, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_opa(item, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(item, 1, 0);
-    lv_obj_set_style_border_color(item, lv_color_hex(configured ? 0x4C4C4C : 0x272727), 0);
+    lv_obj_set_style_border_color(item, lv_color_hex(0x4C4C4C), 0);
     lv_obj_set_style_radius(item, 0, 0);
     lv_obj_clear_flag(item, LV_OBJ_FLAG_CLICKABLE);
     g_radialMenu.itemObjects[direction] = item;
 
-    if (configured) {
-      char radialPath[40];
-      snprintf(radialPath, sizeof(radialPath), RADIAL_ICON_FORMAT, row, col,
-               radialDirectionName(direction));
-      lv_obj_t* icon = create_icon_image(radialPath);
-      if (icon) {
-        lv_obj_set_parent(icon, item);
-        lv_obj_center(icon);
-        lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
-      } else {
-        lv_obj_t* label = lv_label_create(item);
-        lv_label_set_text(label, radialDirectionName(direction));
-        lv_obj_set_style_text_color(label, lv_color_hex(0xD0D0D0), 0);
-        lv_obj_center(label);
-      }
+    char radialPath[40];
+    snprintf(radialPath, sizeof(radialPath), RADIAL_ICON_FORMAT, row, col,
+             radialDirectionName(direction));
+    lv_obj_t* icon = create_icon_image(radialPath);
+    if (icon) {
+      lv_obj_set_parent(icon, item);
+      lv_obj_center(icon);
+      lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+      lv_obj_t* label = lv_label_create(item);
+      lv_label_set_text(label, radialDirectionName(direction));
+      lv_obj_set_style_text_color(label, lv_color_hex(0xD0D0D0), 0);
+      lv_obj_center(label);
     }
   }
 

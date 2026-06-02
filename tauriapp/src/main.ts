@@ -37,6 +37,7 @@ type HostCommandAction = {
 
 type RadialItem = {
   direction: RadialDirection;
+  enabled: boolean;
   actions: MacroAction[];
   hostActions: HostCommandAction[];
   previewDataUrl: string | null;
@@ -157,6 +158,7 @@ type MacroJsonDoc = {
       enabled: boolean;
       items: Array<{
         direction: RadialDirection;
+        enabled?: boolean;
         actions: MacroAction[];
         hostActions?: HostCommandAction[];
       }>;
@@ -224,6 +226,7 @@ const state: AppState = {
 function createDefaultRadialItems(): RadialItem[] {
   return RADIAL_DIRECTIONS.map((direction) => ({
     direction,
+    enabled: true,
     actions: [],
     hostActions: [],
     previewDataUrl: null,
@@ -434,9 +437,12 @@ function buildMacroDocument(): MacroJsonDoc {
     },
     icons: state.icons.map((icon) => {
       const radialItems = icon.radialItems
-        .filter((item) => item.actions.length > 0 || item.hostActions.length > 0)
+        .filter((item) =>
+          item.enabled && (item.actions.length > 0 || item.hostActions.length > 0)
+        )
         .map((item) => ({
           direction: item.direction,
+          enabled: item.enabled,
           actions: item.actions,
           hostActions: item.hostActions,
         }));
@@ -447,7 +453,7 @@ function buildMacroDocument(): MacroJsonDoc {
         col: icon.col,
         actions: icon.actions,
         hostActions: icon.hostActions,
-        ...(icon.radialEnabled
+        ...(icon.radialEnabled && radialItems.length > 0
           ? {
             radial: {
               enabled: true,
@@ -555,6 +561,9 @@ function applyMacroDocument(doc: unknown, markDirty = true): void {
           if (!radialItem) {
             continue;
           }
+
+          const radialEnabledRaw = (itemRaw as { enabled?: unknown }).enabled;
+          radialItem.enabled = radialEnabledRaw === undefined ? true : Boolean(radialEnabledRaw);
 
           const radialActionsRaw = (itemRaw as { actions?: unknown }).actions;
           if (Array.isArray(radialActionsRaw)) {
@@ -817,7 +826,7 @@ function iconCardMarkup(icon: IconSlot): string {
   const isSelected = icon.index === state.selectedIndex;
   const dirty = iconHasPendingChanges(icon);
   const radialCount = icon.radialItems.filter((item) =>
-    item.actions.length > 0 || item.hostActions.length > 0
+    item.enabled && (item.actions.length > 0 || item.hostActions.length > 0)
   ).length;
   const classes = ["icon-card"];
   if (isSelected) classes.push("selected");
@@ -981,9 +990,10 @@ function radialDirectionGridMarkup(icon: IconSlot): string {
 
         const item = icon.radialItems.find((entry) => entry.direction === cell);
         const configured = !!item && (item.actions.length > 0 || item.hostActions.length > 0);
+        const enabled = item?.enabled ?? true;
         const selected = cell === state.selectedRadialDirection;
         return `
-          <button class="radial-slot ${selected ? "selected" : ""} ${configured ? "configured" : ""}" data-radial-direction="${cell}">
+          <button class="radial-slot ${selected ? "selected" : ""} ${configured ? "configured" : ""} ${enabled ? "" : "disabled"}" data-radial-direction="${cell}">
             ${item?.previewDataUrl ? `<img src="${item.previewDataUrl}" alt="${cell} radial icon" />` : `<span>${radialDirectionLabel(cell)}</span>`}
           </button>
         `;
@@ -1006,8 +1016,13 @@ function radialEditorMarkup(icon: IconSlot): string {
 
       <div class="radial-selected-head">
         <h3>${radialDirectionLabel(item.direction)} Slot</h3>
-        <span class="action-count">${item.actions.length + item.hostActions.length} configured</span>
+        <span class="action-count">${item.enabled ? "Enabled" : "Disabled"} - ${item.actions.length + item.hostActions.length} configured</span>
       </div>
+
+      <label class="radial-enable">
+        <input id="radialItemEnabledInput" type="checkbox" ${item.enabled ? "checked" : ""} />
+        Show this slot on device
+      </label>
 
       <div class="preview-box radial-preview">
         ${item.previewDataUrl ? `<img src="${item.previewDataUrl}" alt="Radial icon preview" />` : `<div class="preview-placeholder">${radialDirectionLabel(item.direction)}</div>`}
@@ -1273,6 +1288,15 @@ function bindEvents(): void {
   radialEnabledInput?.addEventListener("change", () => {
     const icon = selectedIcon();
     icon.radialEnabled = radialEnabledInput.checked;
+    markMacroDirty(icon.index);
+    render();
+  });
+
+  const radialItemEnabledInput = app.querySelector<HTMLInputElement>("#radialItemEnabledInput");
+  radialItemEnabledInput?.addEventListener("change", () => {
+    const icon = selectedIcon();
+    const item = selectedRadialItem();
+    item.enabled = radialItemEnabledInput.checked;
     markMacroDirty(icon.index);
     render();
   });

@@ -294,6 +294,7 @@ size        = 1*DIGIT ; decimal integer 1..1048576
         "items": [
           {
             "direction": "n",
+            "enabled": true,
             "actions": [{ "type": "combo", "key": "A", "mods": [] }],
             "hostActions": []
           }

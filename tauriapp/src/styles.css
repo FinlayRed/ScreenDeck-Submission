@@ -506,6 +506,14 @@ button.danger:hover {
   background: var(--ok-bg);
 }
 
+.radial-slot.disabled {
+  opacity: 0.48;
+}
+
+.radial-slot.disabled.configured::after {
+  background: var(--text-dim);
+}
+
 .radial-slot.configured::after {
   content: "";
   position: absolute;
