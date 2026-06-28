@@ -44,7 +44,7 @@ const LISTENER_PAUSE_WAIT_MS: u64 = 8000;
 const LISTENER_HANDSHAKE_TIMEOUT_MS: u64 = 500;
 const COMPANION_SETTINGS_FILE: &str = "companion-settings.json";
 const COMPANION_MACROS_FILE: &str = "companion-macros.json";
-const RADIAL_DIRECTIONS: [&str; 8] = ["n", "ne", "e", "se", "s", "sw", "w", "nw"];
+const RADIAL_DIRECTIONS: [&str; 4] = ["n", "e", "s", "w"];
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

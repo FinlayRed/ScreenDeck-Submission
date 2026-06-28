@@ -41,10 +41,10 @@
 #define FALLBACK_ICON_PATH "/fallback.bin"
 #define ICON_FORMAT "/icon_%d_%d.bin"  // Format: icon_row_col.bin
 #define RADIAL_ICON_FORMAT "/radial_%d_%d_%s.bin"
-#define RADIAL_DIRECTION_COUNT 8
+#define RADIAL_DIRECTION_COUNT 4
 #define RADIAL_MENU_GAP 17
 #define RADIAL_MENU_OPEN_DRAG_PX 5
-#define RADIAL_MENU_DEADZONE_PX 42
+#define RADIAL_MENU_DEADZONE_PX 20
 
 #ifndef KEY_LEFT_CTRL
 #define KEY_LEFT_CTRL 0x80
@@ -271,6 +271,8 @@ struct RadialMenuState {
   int selectedDirection = -1;
   lv_point_t origin = {0, 0};
   lv_point_t pressPoint = {0, 0};
+  lv_point_t bestPoint = {0, 0};
+  int bestDistance = 0;
   bool hasPressPoint = false;
   lv_obj_t* overlay = nullptr;
   lv_obj_t* sourceButton = nullptr;
@@ -431,7 +433,7 @@ static bool startsWithIgnoreCase(const char* value, const char* prefix) {
 
 static const char* radialDirectionName(uint8_t directionIndex) {
   static const char* kDirectionNames[RADIAL_DIRECTION_COUNT] = {
-      "n", "ne", "e", "se", "s", "sw", "w", "nw"};
+      "n", "e", "s", "w"};
 
   if (directionIndex >= RADIAL_DIRECTION_COUNT) {
     return "";
@@ -456,8 +458,7 @@ static bool radialDirectionIndexFromName(const char* name, uint8_t& directionInd
 
 static bool radialDirectionOffset(uint8_t directionIndex, int& offsetX, int& offsetY) {
   static const int8_t kOffsets[RADIAL_DIRECTION_COUNT][2] = {
-      {0, -1}, {1, -1}, {1, 0}, {1, 1},
-      {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}};
+      {0, -1}, {1, 0}, {0, 1}, {-1, 0}};
 
   if (directionIndex >= RADIAL_DIRECTION_COUNT) {
     return false;
@@ -1657,16 +1658,11 @@ static int radialDirectionFromPoint(const lv_point_t& point) {
     return -1;
   }
 
-  float angle = atan2f(static_cast<float>(-dy), static_cast<float>(dx)) * 180.0f /
-                3.14159265f;
-  if (angle < 0.0f) {
-    angle += 360.0f;
+  if (abs(dx) > abs(dy)) {
+    return dx > 0 ? 1 : 3;
   }
 
-  int sector = static_cast<int>(floorf((angle + 22.5f) / 45.0f)) % 8;
-  static const int8_t kSectorToDirection[8] = {
-      2, 1, 0, 7, 6, 5, 4, 3};
-  return kSectorToDirection[sector];
+  return dy > 0 ? 2 : 0;
 }
 
 static bool radialDragExceededOpenThreshold(const lv_point_t& point) {
@@ -1677,6 +1673,18 @@ static bool radialDragExceededOpenThreshold(const lv_point_t& point) {
   int dx = point.x - g_radialMenu.pressPoint.x;
   int dy = point.y - g_radialMenu.pressPoint.y;
   return max(abs(dx), abs(dy)) >= RADIAL_MENU_OPEN_DRAG_PX;
+}
+
+static int radialDistanceFromOrigin(const lv_point_t& point) {
+  int dx = point.x - g_radialMenu.origin.x;
+  int dy = point.y - g_radialMenu.origin.y;
+  return max(abs(dx), abs(dy));
+}
+
+static void resetRadialGestureTracking() {
+  g_radialMenu.bestPoint = g_radialMenu.pressPoint;
+  g_radialMenu.bestDistance = 0;
+  g_radialMenu.selectedDirection = -1;
 }
 
 static void suppressSourceButtonTapFeedback(lv_obj_t* btn) {
@@ -1726,6 +1734,17 @@ static void updateRadialSelection(int selectedDirection) {
   }
 }
 
+static void updateRadialGestureCandidate(const lv_point_t& point) {
+  int distance = radialDistanceFromOrigin(point);
+  if (distance < g_radialMenu.bestDistance) {
+    return;
+  }
+
+  g_radialMenu.bestPoint = point;
+  g_radialMenu.bestDistance = distance;
+  updateRadialSelection(radialDirectionFromPoint(g_radialMenu.bestPoint));
+}
+
 static void hideRadialMenu() {
   restoreSourceButtonTapFeedback();
 
@@ -1757,7 +1776,7 @@ static void maybeOpenRadialMenuFromDrag(uint8_t iconIndex, int row, int col,
   }
 
   showRadialMenu(iconIndex, row, col, sourceButton, g_radialMenu.origin);
-  updateRadialSelection(radialDirectionFromPoint(point));
+  updateRadialGestureCandidate(point);
 }
 
 static void showRadialMenu(uint8_t iconIndex, int row, int col, lv_obj_t* sourceButton,
@@ -1774,6 +1793,7 @@ static void showRadialMenu(uint8_t iconIndex, int row, int col, lv_obj_t* source
   g_radialMenu.row = row;
   g_radialMenu.col = col;
   g_radialMenu.origin = origin;
+  resetRadialGestureTracking();
   g_radialMenu.sourceButton = sourceButton;
   suppressSourceButtonTapFeedback(g_radialMenu.sourceButton);
 
@@ -1856,7 +1876,7 @@ static void showRadialMenu(uint8_t iconIndex, int row, int col, lv_obj_t* source
     lv_obj_clear_flag(centerIcon, LV_OBJ_FLAG_CLICKABLE);
   }
 
-  updateRadialSelection(-1);
+  updateRadialSelection(g_radialMenu.selectedDirection);
 }
 
 static void updateRadialMenuFromTouch() {
@@ -1869,7 +1889,7 @@ static void updateRadialMenuFromTouch() {
     return;
   }
 
-  updateRadialSelection(radialDirectionFromPoint(point));
+  updateRadialGestureCandidate(point);
 }
 
 static bool executeRadialDirection(uint8_t iconIndex, int row, int col,
@@ -1916,9 +1936,9 @@ static bool handleFastRadialRelease(uint8_t iconIndex, int row, int col) {
     return false;
   }
 
-  int selectedDirection = radialDirectionFromPoint(point);
+  updateRadialGestureCandidate(point);
   g_radialMenu.suppressNextClick = true;
-  executeRadialDirection(iconIndex, row, col, selectedDirection);
+  executeRadialDirection(iconIndex, row, col, g_radialMenu.selectedDirection);
   return true;
 }
 
@@ -2018,6 +2038,7 @@ static void btn_event_handler(lv_event_t* e) {
       g_radialMenu.pressPoint = g_radialMenu.origin;
       g_radialMenu.hasPressPoint = true;
     }
+    resetRadialGestureTracking();
     return;
   }
 
@@ -2029,6 +2050,10 @@ static void btn_event_handler(lv_event_t* e) {
     if (g_radialMenu.active) {
       updateRadialMenuFromTouch();
     } else if (iconIndex >= 0 && iconIndex < TOTAL_BUTTONS) {
+      lv_point_t point;
+      if (getActivePointerPoint(point)) {
+        updateRadialGestureCandidate(point);
+      }
       maybeOpenRadialMenuFromDrag(static_cast<uint8_t>(iconIndex), row, col, btn);
     }
     return;
@@ -2047,6 +2072,8 @@ static void btn_event_handler(lv_event_t* e) {
 
   if (code == LV_EVENT_PRESS_LOST) {
     if (g_radialMenu.active) {
+      updateRadialMenuFromTouch();
+      executeRadialMenuSelection();
       hideRadialMenu();
     }
     return;

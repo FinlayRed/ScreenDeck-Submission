@@ -164,7 +164,7 @@ Only these paths are accepted:
 - `/macros.json`
 - `/fallback.bin`
 - `/icon_<row>_<col>.bin` where `row` is `0..3`, `col` is `0..7`
-- `/radial_<row>_<col>_<direction>.bin` where `direction` is `n`, `ne`, `e`, `se`, `s`, `sw`, `w`, or `nw`
+- `/radial_<row>_<col>_<direction>.bin` where `direction` is `n`, `e`, `s`, or `w`
 
 Anything else returns:
 
@@ -271,7 +271,7 @@ get         = "GET" SP path
 path        = "/macros.json" / "/fallback.bin" / "/icon_" row "_" col ".bin" / "/radial_" row "_" col "_" direction ".bin"
 row         = "0" / "1" / "2" / "3"
 col         = "0" / "1" / "2" / "3" / "4" / "5" / "6" / "7"
-direction   = "n" / "ne" / "e" / "se" / "s" / "sw" / "w" / "nw"
+direction   = "n" / "e" / "s" / "w"
 size        = 1*DIGIT ; decimal integer 1..1048576
 ```
 

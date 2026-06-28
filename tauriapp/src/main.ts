@@ -8,7 +8,7 @@ const GRID_SIZE = GRID_ROWS * GRID_COLS;
 const ICON_SIZE = 85;
 const ICON_BYTE_SIZE = ICON_SIZE * ICON_SIZE * 2;
 const MAX_ACTIONS_PER_ICON = 24;
-const RADIAL_DIRECTIONS = ["n", "ne", "e", "se", "s", "sw", "w", "nw"] as const;
+const RADIAL_DIRECTIONS = ["n", "e", "s", "w"] as const;
 
 type Mod = "CTRL" | "SHIFT" | "ALT" | "GUI";
 type RadialDirection = typeof RADIAL_DIRECTIONS[number];
@@ -979,13 +979,17 @@ function scriptEditorMarkup(title: string, hostActions: HostCommandAction[]): st
 }
 
 function radialDirectionGridMarkup(icon: IconSlot): string {
-  const cells: Array<RadialDirection | "center"> = ["nw", "n", "ne", "w", "center", "e", "sw", "s", "se"];
+  const cells: Array<RadialDirection | "center" | "empty"> = ["empty", "n", "empty", "w", "center", "e", "empty", "s", "empty"];
 
   return `
     <div class="radial-grid">
       ${cells.map((cell) => {
         if (cell === "center") {
           return `<div class="radial-center">${icon.previewDataUrl ? `<img src="${icon.previewDataUrl}" alt="Center icon" />` : ""}</div>`;
+        }
+
+        if (cell === "empty") {
+          return `<div class="radial-empty"></div>`;
         }
 
         const item = icon.radialItems.find((entry) => entry.direction === cell);

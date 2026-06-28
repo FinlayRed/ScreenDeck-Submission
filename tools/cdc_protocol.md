@@ -19,7 +19,7 @@ Allowed upload paths:
 - `/macros.json`
 - `/fallback.bin`
 - `/icon_<row>_<col>.bin` where row is `0..3` and col is `0..7`
-- `/radial_<row>_<col>_<direction>.bin` where direction is `n`, `ne`, `e`, `se`, `s`, `sw`, `w`, or `nw`
+- `/radial_<row>_<col>_<direction>.bin` where direction is `n`, `e`, `s`, or `w`
 
 Macro config:
 - `macros.json` version `2` adds optional per-icon radial menus.

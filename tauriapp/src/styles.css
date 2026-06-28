@@ -477,9 +477,14 @@ button.danger:hover {
 }
 
 .radial-slot,
-.radial-center {
+.radial-center,
+.radial-empty {
   width: 54px;
   height: 54px;
+}
+
+.radial-slot,
+.radial-center {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface-2);
