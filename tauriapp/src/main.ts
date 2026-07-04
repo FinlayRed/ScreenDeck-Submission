@@ -1,3 +1,4 @@
+import { open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/tauri";
 import "./styles.css";
@@ -77,6 +78,32 @@ type SendUpdatesPayload = {
 
 type SendUpdatesResult = {
   logs: string[];
+};
+
+type ScreensaverUploadPayload = {
+  portName: string;
+  baudRate: number;
+  sourcePath: string;
+  ffmpegPath: string | null;
+  width: number;
+  height: number;
+  fps: number;
+  durationSeconds: number;
+  quality: number;
+  testLoops: number | null;
+};
+
+type ScreensaverUploadResult = {
+  logs: string[];
+  outputBytes: number;
+  frameCount: number;
+  maxFrameBytes: number;
+  playbackLine: string | null;
+};
+
+type LocalFileInfo = {
+  name: string;
+  bytes: number;
 };
 
 type UploadProgressEvent = {
@@ -183,8 +210,16 @@ type AppState = {
   logs: string[];
   sending: boolean;
   syncing: boolean;
+  uploadingScreensaver: boolean;
   uploadProgress: UploadProgressEvent | null;
   companionStatus: CompanionStatus | null;
+  screensaverFilePath: string;
+  screensaverFileName: string;
+  screensaverFileBytes: number;
+  screensaverFps: number;
+  screensaverDurationSeconds: number;
+  screensaverQuality: number;
+  screensaverTestLoops: number;
   macrosDirty: boolean;
   error: string | null;
   newActionDraft: NewActionDraft | null;
@@ -213,8 +248,16 @@ const state: AppState = {
   logs: [],
   sending: false,
   syncing: false,
+  uploadingScreensaver: false,
   uploadProgress: null,
   companionStatus: null,
+  screensaverFilePath: "",
+  screensaverFileName: "",
+  screensaverFileBytes: 0,
+  screensaverFps: 15,
+  screensaverDurationSeconds: 10,
+  screensaverQuality: 24,
+  screensaverTestLoops: 5,
   macrosDirty: false,
   error: null,
   newActionDraft: null,
@@ -653,6 +696,10 @@ function uploadProgressHeadline(progress: UploadProgressEvent): string {
     return "Finalizing device reload";
   }
 
+  if (progress.phase === "committing") {
+    return "Waiting for device";
+  }
+
   if (progress.phase === "complete") {
     return "Upload complete";
   }
@@ -665,6 +712,10 @@ function uploadProgressHeadline(progress: UploadProgressEvent): string {
 }
 
 function uploadProgressDetail(progress: UploadProgressEvent): string {
+  if (progress.phase === "committing") {
+    return "All bytes sent. Waiting for the device to close the SD file.";
+  }
+
   if (progress.phase === "uploading" && progress.filePath) {
     const fileLabel = progress.fileCount > 0 ? `File ${progress.fileIndex}/${progress.fileCount}` : "Uploading";
     return `${fileLabel} - ${formatBytes(progress.fileBytesSent)} of ${formatBytes(progress.fileTotalBytes)}`;
@@ -676,7 +727,7 @@ function uploadProgressDetail(progress: UploadProgressEvent): string {
 async function setupUploadProgressListener(): Promise<void> {
   await listen<UploadProgressEvent>("upload-progress", (event) => {
     state.uploadProgress = event.payload;
-    if (state.sending) {
+    if (state.sending || state.uploadingScreensaver) {
       render();
     }
   });
@@ -1055,6 +1106,10 @@ function render(): void {
   const changed = hasPendingChanges();
   const uploadProgress = state.uploadProgress;
   const companionStatus = state.companionStatus;
+  const screensaverBusy = state.uploadingScreensaver;
+  const screensaverFileLabel = state.screensaverFileName
+    ? `${state.screensaverFileName} (${formatBytes(state.screensaverFileBytes)})`
+    : "No GIF or video selected";
   const selectedPortStatus = state.selectedPort
     ? isPortResponsive(state.selectedPort)
       ? "Selected port responds to CDC"
@@ -1089,8 +1144,8 @@ function render(): void {
           <input id="baudRateInput" type="number" value="${state.baudRate}" min="1200" max="2000000" step="1" />
         </div>
         <button id="refreshPortsBtn" class="secondary">Refresh Ports</button>
-        <button id="sendBtn" class="primary" ${state.sending || state.syncing ? "disabled" : ""}>${state.sending ? "Sending..." : "Send Changes To Device"}</button>
-        <button id="syncBtn" class="secondary" ${state.sending || state.syncing ? "disabled" : ""}>${state.syncing ? "Syncing..." : "Sync From Device"}</button>
+        <button id="sendBtn" class="primary" ${state.sending || state.syncing || state.uploadingScreensaver ? "disabled" : ""}>${state.sending ? "Sending..." : "Send Changes To Device"}</button>
+        <button id="syncBtn" class="secondary" ${state.sending || state.syncing || state.uploadingScreensaver ? "disabled" : ""}>${state.syncing ? "Syncing..." : "Sync From Device"}</button>
         <button id="toggleCompanionBtn" class="secondary">${companionStatus?.listenerEnabled === false ? "Resume Companion" : "Pause Companion"}</button>
         <div class="transport-note">${escapeHtml(selectedPortStatus)}</div>
         <div class="companion-panel">
@@ -1105,7 +1160,39 @@ function render(): void {
           ${companionStatus?.lastExecution ? `<div class="companion-detail">Last host action: ${escapeHtml(companionStatus.lastExecution)}</div>` : ""}
           ${companionStatus?.lastError ? `<div class="companion-detail error">${escapeHtml(companionStatus.lastError)}</div>` : ""}
         </div>
-        ${state.sending && uploadProgress
+
+        <div class="screensaver-panel">
+          <div class="screensaver-header">
+            <div>
+              <strong>Animated Screensaver</strong>
+              <span>${escapeHtml(screensaverFileLabel)}</span>
+            </div>
+            <div class="button-row">
+              <button id="pickScreensaverBtn" class="secondary" ${state.sending || state.syncing || screensaverBusy ? "disabled" : ""}>Choose GIF / Video</button>
+              <button id="uploadScreensaverBtn" class="primary" ${state.sending || state.syncing || screensaverBusy || !state.screensaverFilePath ? "disabled" : ""}>${screensaverBusy ? "Uploading..." : "Upload Screensaver"}</button>
+            </div>
+          </div>
+          <div class="screensaver-controls">
+            <label>
+              FPS
+              <input id="screensaverFpsInput" type="number" value="${state.screensaverFps}" min="1" max="60" step="1" />
+            </label>
+            <label>
+              Seconds
+              <input id="screensaverDurationInput" type="number" value="${state.screensaverDurationSeconds}" min="0.5" max="600" step="0.5" />
+            </label>
+            <label>
+              Quality
+              <input id="screensaverQualityInput" type="number" value="${state.screensaverQuality}" min="2" max="31" step="1" />
+            </label>
+            <label>
+              Test loops
+              <input id="screensaverTestLoopsInput" type="number" value="${state.screensaverTestLoops}" min="0" max="20" step="1" />
+            </label>
+          </div>
+        </div>
+
+        ${(state.sending || state.uploadingScreensaver) && uploadProgress
           ? `
             <div class="upload-progress-panel">
               <div class="upload-progress-header">
@@ -1227,6 +1314,40 @@ function bindEvents(): void {
   const toggleCompanionBtn = app.querySelector<HTMLButtonElement>("#toggleCompanionBtn");
   toggleCompanionBtn?.addEventListener("click", () => {
     void setCompanionListenerEnabled(!(state.companionStatus?.listenerEnabled ?? true));
+  });
+
+  const pickScreensaverBtn = app.querySelector<HTMLButtonElement>("#pickScreensaverBtn");
+  pickScreensaverBtn?.addEventListener("click", () => {
+    void chooseScreensaverSource();
+  });
+
+  const screensaverFpsInput = app.querySelector<HTMLInputElement>("#screensaverFpsInput");
+  screensaverFpsInput?.addEventListener("change", () => {
+    state.screensaverFps = clamp(Number(screensaverFpsInput.value) || 15, 1, 60);
+    render();
+  });
+
+  const screensaverDurationInput = app.querySelector<HTMLInputElement>("#screensaverDurationInput");
+  screensaverDurationInput?.addEventListener("change", () => {
+    state.screensaverDurationSeconds = clamp(Number(screensaverDurationInput.value) || 10, 0.5, 600);
+    render();
+  });
+
+  const screensaverQualityInput = app.querySelector<HTMLInputElement>("#screensaverQualityInput");
+  screensaverQualityInput?.addEventListener("change", () => {
+    state.screensaverQuality = clamp(Number(screensaverQualityInput.value) || 24, 2, 31);
+    render();
+  });
+
+  const screensaverTestLoopsInput = app.querySelector<HTMLInputElement>("#screensaverTestLoopsInput");
+  screensaverTestLoopsInput?.addEventListener("change", () => {
+    state.screensaverTestLoops = clamp(Number(screensaverTestLoopsInput.value) || 0, 0, 20);
+    render();
+  });
+
+  const uploadScreensaverBtn = app.querySelector<HTMLButtonElement>("#uploadScreensaverBtn");
+  uploadScreensaverBtn?.addEventListener("click", () => {
+    void uploadScreensaver();
   });
 
   const pickImageBtn = app.querySelector<HTMLButtonElement>("#pickImageBtn");
@@ -1768,7 +1889,7 @@ async function refreshPorts(): Promise<void> {
 }
 
 async function sendChanges(): Promise<void> {
-  if (state.sending || state.syncing) {
+  if (state.sending || state.syncing || state.uploadingScreensaver) {
     return;
   }
 
@@ -1917,8 +2038,137 @@ async function sendChanges(): Promise<void> {
   }
 }
 
+async function chooseScreensaverSource(): Promise<void> {
+  try {
+    const selected = await open({
+      multiple: false,
+      filters: [
+        {
+          name: "GIF and video",
+          extensions: ["gif", "mp4", "mov", "webm", "mkv", "avi", "m4v"],
+        },
+        {
+          name: "All files",
+          extensions: ["*"],
+        },
+      ],
+    });
+
+    if (selected === null || Array.isArray(selected)) {
+      return;
+    }
+
+    const info = await invoke<LocalFileInfo>("get_local_file_info", { path: selected });
+    state.screensaverFilePath = selected;
+    state.screensaverFileName = info.name;
+    state.screensaverFileBytes = info.bytes;
+    state.error = null;
+    appendLog(`Selected screensaver source: ${info.name} (${formatBytes(info.bytes)})`);
+  } catch (error) {
+    state.error = `Screensaver file selection failed: ${String(error)}`;
+    appendLog(state.error);
+  }
+
+  render();
+}
+
+async function uploadScreensaver(): Promise<void> {
+  if (state.sending || state.syncing || state.uploadingScreensaver) {
+    return;
+  }
+
+  if (!state.screensaverFilePath) {
+    state.error = "Choose a GIF or video before uploading a screensaver.";
+    render();
+    return;
+  }
+
+  if (!state.selectedPort) {
+    await refreshPorts();
+    if (!state.selectedPort) {
+      state.error = "Select a serial port before uploading a screensaver.";
+      render();
+      return;
+    }
+  }
+
+  if (!isPortResponsive(state.selectedPort)) {
+    appendLog(`Selected port ${state.selectedPort} is not confirmed responsive, probing again...`);
+    await refreshPorts();
+    if (!state.selectedPort || !isPortResponsive(state.selectedPort)) {
+      state.error = "No responsive CDC device found for screensaver upload.";
+      appendLog(state.error);
+      render();
+      return;
+    }
+  }
+
+  const payload: ScreensaverUploadPayload = {
+    portName: state.selectedPort,
+    baudRate: state.baudRate,
+    sourcePath: state.screensaverFilePath,
+    ffmpegPath: null,
+    width: 800,
+    height: 480,
+    fps: state.screensaverFps,
+    durationSeconds: state.screensaverDurationSeconds,
+    quality: state.screensaverQuality,
+    testLoops: state.screensaverTestLoops > 0 ? state.screensaverTestLoops : null,
+  };
+
+  state.uploadingScreensaver = true;
+  state.error = null;
+  state.uploadProgress = {
+    phase: "preparing",
+    currentBytes: 0,
+    totalBytes: 0,
+    fileBytesSent: 0,
+    fileTotalBytes: 0,
+    filePath: "screensaver conversion",
+    fileIndex: 0,
+    fileCount: 1,
+  };
+  appendLog(`Starting screensaver conversion from ${state.screensaverFileName || state.screensaverFilePath}`);
+  render();
+
+  try {
+    const result = await invoke<ScreensaverUploadResult>("upload_screensaver", { request: payload });
+    for (const line of result.logs) {
+      appendLog(line);
+    }
+    appendLog(
+      `Screensaver ready: ${result.frameCount} frame(s), ${formatBytes(result.outputBytes)}, max frame ${formatBytes(result.maxFrameBytes)}`,
+    );
+    if (result.playbackLine) {
+      appendLog(result.playbackLine);
+    }
+  } catch (error) {
+    const rawError = String(error);
+    const splitToken = "---LOGS---\n";
+    const splitIndex = rawError.indexOf(splitToken);
+
+    if (splitIndex >= 0) {
+      const summary = rawError.slice(0, splitIndex).trim();
+      const logsPart = rawError.slice(splitIndex + splitToken.length);
+      state.error = `Screensaver upload failed: ${summary}`;
+      for (const line of logsPart.split(/\r?\n/)) {
+        if (line.trim()) {
+          appendLog(line.trim());
+        }
+      }
+    } else {
+      state.error = `Screensaver upload failed: ${rawError}`;
+    }
+    appendLog(state.error);
+  } finally {
+    state.uploadingScreensaver = false;
+    state.uploadProgress = null;
+    render();
+  }
+}
+
 async function syncFromDevice(): Promise<void> {
-  if (state.sending || state.syncing) {
+  if (state.sending || state.syncing || state.uploadingScreensaver) {
     return;
   }
 

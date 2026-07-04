@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import pathlib
+import struct
 import sys
 import time
 
 import serial
 
 
-def read_cdc_line(port: serial.Serial, timeout_s: float) -> str:
+def read_cdc_line(port: serial.Serial, timeout_s: float, echo: bool = True) -> str:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         raw = port.readline()
@@ -18,7 +19,8 @@ def read_cdc_line(port: serial.Serial, timeout_s: float) -> str:
         if not line:
             continue
 
-        print(line)
+        if echo:
+            print(line, flush=True)
         if line.startswith("CDC:"):
             return line
 
@@ -26,7 +28,7 @@ def read_cdc_line(port: serial.Serial, timeout_s: float) -> str:
 
 
 def send_command(port: serial.Serial, command: str, timeout_s: float) -> str:
-    print(f">>> {command}")
+    print(f">>> {command}", flush=True)
     port.write((command + "\n").encode("utf-8"))
     port.flush()
     return read_cdc_line(port, timeout_s)
@@ -40,19 +42,25 @@ def upload_file(
     chunk_size: int,
     retries: int,
     inter_chunk_ms: float,
+    chunk_ack: bool,
 ) -> None:
     data = local_path.read_bytes()
 
     if not data:
         raise RuntimeError(f"{local_path} is empty")
 
+    if chunk_ack:
+        upload_file_chunked(port, data, remote_path, timeout_s, chunk_size)
+        return
+
     for attempt in range(retries + 1):
         response = send_command(port, f"PUT {remote_path} {len(data)}", timeout_s)
         if not response.startswith("CDC:READY PUT"):
             raise RuntimeError(f"Expected READY, got: {response}")
 
-        print(f">>> sending {len(data)} bytes in chunks of {chunk_size}")
+        print(f">>> sending {len(data)} bytes in chunks of {chunk_size}", flush=True)
         offset = 0
+        next_progress = 1024 * 1024
         while offset < len(data):
             end = min(offset + chunk_size, len(data))
             chunk = data[offset:end]
@@ -63,6 +71,9 @@ def upload_file(
                 )
 
             offset = end
+            if offset >= next_progress or offset == len(data):
+                print(f">>> sent {offset}/{len(data)} bytes", flush=True)
+                next_progress += 1024 * 1024
             if inter_chunk_ms > 0:
                 time.sleep(inter_chunk_ms / 1000.0)
 
@@ -72,8 +83,11 @@ def upload_file(
         if response.startswith("CDC:OK PUT"):
             return
 
-        if response == "CDC:ERR PUT TIMEOUT" and attempt < retries:
-            print(f"Retrying upload ({attempt + 1}/{retries}) after PUT TIMEOUT")
+        if response.startswith("CDC:ERR PUT TIMEOUT") and attempt < retries:
+            print(
+                f"Retrying upload ({attempt + 1}/{retries}) after PUT TIMEOUT",
+                flush=True,
+            )
             time.sleep(0.2)
             port.reset_input_buffer()
             continue
@@ -81,6 +95,56 @@ def upload_file(
         raise RuntimeError(f"Expected OK PUT, got: {response}")
 
     raise RuntimeError("Upload retries exhausted")
+
+
+def upload_file_chunked(
+    port: serial.Serial,
+    data: bytes,
+    remote_path: str,
+    timeout_s: float,
+    chunk_size: int,
+) -> None:
+    if chunk_size > 1024:
+        raise RuntimeError("--chunk-size must be <= 1024 when --chunk-ack is used")
+
+    response = send_command(port, f"PUTC {remote_path} {len(data)}", timeout_s)
+    if not response.startswith("CDC:READY PUTC"):
+        raise RuntimeError(f"Expected READY PUTC, got: {response}")
+
+    print(f">>> sending {len(data)} bytes in acked chunks of {chunk_size}", flush=True)
+    offset = 0
+    next_progress = 1024 * 1024
+    while offset < len(data):
+        end = min(offset + chunk_size, len(data))
+        chunk = data[offset:end]
+        port.write(struct.pack("<H", len(chunk)))
+        written = port.write(chunk)
+        if written != len(chunk):
+            raise RuntimeError(
+                f"Short serial write at {offset}: wrote {written}, expected {len(chunk)}"
+            )
+        port.flush()
+
+        response = read_cdc_line(port, timeout_s, echo=False)
+        if end == len(data):
+            print(response, flush=True)
+            if not response.startswith("CDC:OK PUTC"):
+                raise RuntimeError(f"Expected OK PUTC, got: {response}")
+        else:
+            parts = response.split()
+            if len(parts) != 3 or parts[0] != "CDC:ACK" or parts[1] != "PUTC":
+                raise RuntimeError(f"Expected ACK PUTC, got: {response}")
+            try:
+                received = int(parts[2])
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid ACK offset: {parts[2]}") from exc
+            if received != end:
+                raise RuntimeError(f"ACK offset mismatch: {received} != {end}")
+
+        offset = end
+        if offset >= next_progress or offset == len(data):
+            print(f">>> sent {offset}/{len(data)} bytes", flush=True)
+            next_progress += 1024 * 1024
 
 
 def download_file(
@@ -122,27 +186,44 @@ def download_file(
         raise RuntimeError(f"Expected OK GET, got: {response}")
 
     local_path.write_bytes(payload)
-    print(f"Saved {len(payload)} bytes to {local_path}")
+    print(f"Saved {len(payload)} bytes to {local_path}", flush=True)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Test CDC protocol for icon/macro live reload"
-    )
+    parser = argparse.ArgumentParser(description="Test the ScreenDeck CDC protocol")
     parser.add_argument("--port", required=True, help="Serial port (COM5, /dev/ttyACM0, etc.)")
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--timeout", type=float, default=8.0, help="Response timeout in seconds")
+    parser.add_argument("--timeout", type=float, default=15.0, help="Response timeout in seconds")
     parser.add_argument("--wait", type=float, default=1.0, help="Seconds to wait after opening port")
-    parser.add_argument("--chunk-size", type=int, default=256, help="Binary payload chunk size in bytes")
+    parser.add_argument("--chunk-size", type=int, default=2048, help="Binary payload chunk size in bytes")
     parser.add_argument("--retry", type=int, default=2, help="Retries for PUT TIMEOUT responses")
     parser.add_argument(
         "--inter-chunk-ms",
         type=float,
-        default=1.5,
+        default=0.0,
         help="Delay between binary chunks in milliseconds",
+    )
+    parser.add_argument(
+        "--chunk-ack",
+        action="store_true",
+        help="Use acknowledged PUTC uploads instead of streaming PUT",
     )
     parser.add_argument("--ping", action="store_true", help="Send PING command")
     parser.add_argument("--status", action="store_true", help="Send STATUS command")
+    parser.add_argument("--ss-status", action="store_true", help="Send SS STATUS command")
+    parser.add_argument(
+        "--ss-play",
+        nargs="?",
+        type=int,
+        const=1,
+        metavar="LOOPS",
+        help="Send SS PLAY with an optional loop count",
+    )
+    parser.add_argument(
+        "--command",
+        action="append",
+        help="Send an arbitrary CDC command (can be repeated)",
+    )
     parser.add_argument(
         "--put",
         nargs=2,
@@ -195,6 +276,7 @@ def main() -> int:
                         args.chunk_size,
                         args.retry,
                         args.inter_chunk_ms,
+                        args.chunk_ack,
                     )
 
             if args.get:
@@ -211,7 +293,19 @@ def main() -> int:
                 if not response.startswith("CDC:OK RELOAD"):
                     raise RuntimeError(f"Expected RELOAD OK, got: {response}")
 
-            print("Done")
+            if args.ss_status:
+                send_command(port, "SS STATUS", args.timeout)
+
+            if args.ss_play is not None:
+                if args.ss_play <= 0:
+                    raise RuntimeError("--ss-play loop count must be > 0")
+                send_command(port, f"SS PLAY {args.ss_play}", args.timeout)
+
+            if args.command:
+                for command in args.command:
+                    send_command(port, command, args.timeout)
+
+            print("Done", flush=True)
             return 0
 
     except Exception as exc:  # pylint: disable=broad-except

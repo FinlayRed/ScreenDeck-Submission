@@ -12,6 +12,8 @@
 #endif
 #include <ArduinoJson.h>
 #include <lvgl.h>
+#include <esp_heap_caps.h>
+#include "esp_jpeg_dec.h"
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
@@ -45,6 +47,23 @@
 #define RADIAL_MENU_GAP 17
 #define RADIAL_MENU_OPEN_DRAG_PX 5
 #define RADIAL_MENU_DEADZONE_PX 20
+#define SCREENSAVER_DIR_PATH "/screensavers"
+#define SCREENSAVER_ACTIVE_PATH "/screensavers/active.sdmj"
+#define SCREENSAVER_ACTIVE_SDRA_PATH "/screensavers/active.sdra"
+#define CDC_MAX_TRANSFER_BYTES (64UL * 1024UL * 1024UL)
+#define CDC_UPLOAD_BUFFER_BYTES 1024
+#define SD_SPI_FREQUENCY_HZ 40000000UL
+#define SDMJ_HEADER_SIZE 40
+#define SDMJ_INDEX_ENTRY_SIZE 8
+#define SDMJ_VERSION 1
+#define SDMJ_WIDTH 800
+#define SDMJ_HEIGHT 480
+#define SDMJ_MAX_FRAME_COUNT 10000
+#define SDRA_HEADER_SIZE 40
+#define SDRA_INDEX_ENTRY_SIZE 8
+#define SDRA_FRAME_HEADER_SIZE 4
+#define SDRA_VERSION 1
+#define SDRA_FRAME_FLAG_FULL 1
 
 #ifndef KEY_LEFT_CTRL
 #define KEY_LEFT_CTRL 0x80
@@ -178,7 +197,7 @@
 #endif
 
 // Screensaver configuration
-#define SCREENSAVER_TIMEOUT_MS 6000000      // 1 minute
+#define SCREENSAVER_TIMEOUT_MS 600000      // 1 minute
 #define SCREENSAVER_CHECK_INTERVAL_MS 1000
 
 // Forward declarations (used before definitions)
@@ -187,6 +206,7 @@ void deactivateScreensaver();
 void rebuildGridUI();
 void processCdcInput();
 static void btn_event_handler(lv_event_t* e);
+extern unsigned long lastActivityTime;
 
 // Global variables
 bool sdCardInitialized = false;
@@ -244,13 +264,69 @@ struct MacroExecutorState {
 
 struct CdcUploadSession {
   bool active = false;
+  bool chunked = false;
   char targetPath[64] = {0};
   char tempPath[72] = {0};
   size_t expectedBytes = 0;
   size_t receivedBytes = 0;
+  uint8_t chunkHeader[2] = {0};
+  uint8_t chunkHeaderBytes = 0;
+  uint16_t currentChunkSize = 0;
+  uint16_t currentChunkBytes = 0;
   unsigned long lastDataMs = 0;
   uint8_t sourcePort = 0;
   File file;
+};
+
+struct SdmjFileStatus {
+  bool ok = false;
+  char error[32] = {0};
+  uint32_t fileSize = 0;
+  uint32_t frameCount = 0;
+  uint32_t indexOffset = 0;
+  uint32_t dataOffset = 0;
+  uint32_t dataBytes = 0;
+  uint32_t maxFrameSize = 0;
+  uint32_t crc32 = 0;
+  uint16_t width = 0;
+  uint16_t height = 0;
+  uint16_t fps = 0;
+};
+
+struct SdraFileStatus {
+  bool ok = false;
+  char error[32] = {0};
+  uint32_t fileSize = 0;
+  uint32_t frameCount = 0;
+  uint32_t indexOffset = 0;
+  uint32_t dataOffset = 0;
+  uint32_t dataBytes = 0;
+  uint32_t maxFrameSize = 0;
+  uint32_t crc32 = 0;
+  uint32_t fullFrameBytes = 0;
+  uint16_t width = 0;
+  uint16_t height = 0;
+  uint16_t fps = 0;
+  uint16_t tileSize = 0;
+  uint16_t tilesX = 0;
+  uint16_t tilesY = 0;
+};
+
+struct SdmjFrameEntry {
+  uint32_t offset = 0;
+  uint32_t size = 0;
+};
+
+struct SdmjPlaybackStats {
+  uint32_t framesPresented = 0;
+  uint32_t loopsCompleted = 0;
+  uint32_t droppedFrames = 0;
+  uint32_t decodeErrors = 0;
+  uint32_t maxFrameWorkUs = 0;
+  uint64_t totalReadUs = 0;
+  uint64_t totalDecodeUs = 0;
+  uint64_t totalSwitchUs = 0;
+  uint64_t totalPlayUs = 0;
 };
 
 enum class CdcPortId : uint8_t {
@@ -294,7 +370,10 @@ size_t g_usbLineLength = 0;
 
 constexpr uint16_t kComboHoldMs = 12;
 constexpr uint16_t kComboGapMs = 8;
-constexpr unsigned long kCdcUploadTimeoutMs = 30000;
+constexpr unsigned long kCdcUploadTimeoutMs = 180000;
+
+esp_panel::drivers::LCD* g_lcd = nullptr;
+esp_panel::drivers::Touch* g_touch = nullptr;
 
 static void ensureButtonTapStyles() {
   if (g_buttonTapStylesInitialized) {
@@ -340,7 +419,7 @@ static Stream* streamForPortId(CdcPortId portId) {
 }
 
 static void cdcBroadcast(const char* fmt, ...) {
-  char message[192];
+  char message[320];
 
   va_list args;
   va_start(args, fmt);
@@ -357,7 +436,7 @@ static void cdcBroadcast(const char* fmt, ...) {
 }
 
 static void cdcReplyToPort(CdcPortId portId, const char* fmt, ...) {
-  char message[192];
+  char message[320];
 
   va_list args;
   va_start(args, fmt);
@@ -638,7 +717,9 @@ static bool isAllowedUploadPath(const char* path) {
   }
 
   if (strcmp(path, MACRO_CONFIG_PATH) == 0 ||
-      strcmp(path, FALLBACK_ICON_PATH) == 0) {
+      strcmp(path, FALLBACK_ICON_PATH) == 0 ||
+      strcmp(path, SCREENSAVER_ACTIVE_PATH) == 0 ||
+      strcmp(path, SCREENSAVER_ACTIVE_SDRA_PATH) == 0) {
     return true;
   }
 
@@ -663,6 +744,1222 @@ static bool isIconAssetPath(const char* path) {
   uint8_t directionIndex = 0;
   return parseIconPath(path, row, col) ||
          parseRadialIconPath(path, row, col, directionIndex);
+}
+
+static bool isScreensaverAssetPath(const char* path) {
+  return path != nullptr &&
+         (strcmp(path, SCREENSAVER_ACTIVE_PATH) == 0 ||
+          strcmp(path, SCREENSAVER_ACTIVE_SDRA_PATH) == 0);
+}
+
+static void setSdmjError(SdmjFileStatus& status, const char* error) {
+  snprintf(status.error, sizeof(status.error), "%s", error);
+  status.ok = false;
+}
+
+static uint16_t readLe16(const uint8_t* bytes) {
+  return static_cast<uint16_t>(bytes[0]) |
+         (static_cast<uint16_t>(bytes[1]) << 8);
+}
+
+static uint32_t readLe32(const uint8_t* bytes) {
+  return static_cast<uint32_t>(bytes[0]) |
+         (static_cast<uint32_t>(bytes[1]) << 8) |
+         (static_cast<uint32_t>(bytes[2]) << 16) |
+         (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+static bool readExact(File& file, uint8_t* output, size_t byteCount) {
+  return file.read(output, byteCount) == byteCount;
+}
+
+static bool validateActiveScreensaver(SdmjFileStatus& status) {
+  memset(&status, 0, sizeof(status));
+
+  if (!sdCardInitialized) {
+    setSdmjError(status, "SD_NOT_READY");
+    return false;
+  }
+
+  if (!SD.exists(SCREENSAVER_ACTIVE_PATH)) {
+    setSdmjError(status, "NOT_FOUND");
+    return false;
+  }
+
+  File file = SD.open(SCREENSAVER_ACTIVE_PATH, FILE_READ);
+  if (!file) {
+    setSdmjError(status, "OPEN_FAILED");
+    return false;
+  }
+
+  status.fileSize = static_cast<uint32_t>(file.size());
+  if (status.fileSize < SDMJ_HEADER_SIZE) {
+    file.close();
+    setSdmjError(status, "TOO_SMALL");
+    return false;
+  }
+
+  uint8_t header[SDMJ_HEADER_SIZE] = {0};
+  if (!readExact(file, header, sizeof(header))) {
+    file.close();
+    setSdmjError(status, "HEADER_READ");
+    return false;
+  }
+
+  if (memcmp(header, "SDMJ", 4) != 0) {
+    file.close();
+    setSdmjError(status, "BAD_MAGIC");
+    return false;
+  }
+
+  uint16_t version = readLe16(header + 4);
+  uint16_t headerSize = readLe16(header + 6);
+  status.width = readLe16(header + 8);
+  status.height = readLe16(header + 10);
+  status.fps = readLe16(header + 12);
+  status.frameCount = readLe32(header + 16);
+  status.indexOffset = readLe32(header + 20);
+  status.dataOffset = readLe32(header + 24);
+  uint32_t totalSize = readLe32(header + 28);
+  status.maxFrameSize = readLe32(header + 32);
+  status.crc32 = readLe32(header + 36);
+
+  if (version != SDMJ_VERSION || headerSize != SDMJ_HEADER_SIZE) {
+    file.close();
+    setSdmjError(status, "BAD_VERSION");
+    return false;
+  }
+
+  if (status.width == 0 || status.height == 0 ||
+      status.width > SDMJ_WIDTH || status.height > SDMJ_HEIGHT ||
+      SDMJ_WIDTH % status.width != 0 || SDMJ_HEIGHT % status.height != 0 ||
+      status.fps == 0 || status.fps > 60) {
+    file.close();
+    setSdmjError(status, "BAD_GEOMETRY");
+    return false;
+  }
+
+  if (status.frameCount == 0 || status.frameCount > SDMJ_MAX_FRAME_COUNT) {
+    file.close();
+    setSdmjError(status, "BAD_FRAME_COUNT");
+    return false;
+  }
+
+  uint32_t expectedDataOffset =
+      SDMJ_HEADER_SIZE + status.frameCount * SDMJ_INDEX_ENTRY_SIZE;
+  if (status.indexOffset != SDMJ_HEADER_SIZE ||
+      status.dataOffset != expectedDataOffset ||
+      status.dataOffset > status.fileSize ||
+      totalSize != status.fileSize) {
+    file.close();
+    setSdmjError(status, "BAD_OFFSETS");
+    return false;
+  }
+
+  if (!file.seek(status.indexOffset)) {
+    file.close();
+    setSdmjError(status, "INDEX_SEEK");
+    return false;
+  }
+
+  uint32_t expectedOffset = status.dataOffset;
+  uint32_t largestFrame = 0;
+  for (uint32_t i = 0; i < status.frameCount; i++) {
+    uint8_t entry[SDMJ_INDEX_ENTRY_SIZE] = {0};
+    if (!readExact(file, entry, sizeof(entry))) {
+      file.close();
+      setSdmjError(status, "INDEX_READ");
+      return false;
+    }
+
+    uint32_t frameOffset = readLe32(entry);
+    uint32_t frameSize = readLe32(entry + 4);
+    if (frameSize == 0 || frameOffset != expectedOffset ||
+        frameOffset + frameSize > status.fileSize ||
+        frameOffset + frameSize < frameOffset) {
+      file.close();
+      setSdmjError(status, "BAD_FRAME");
+      return false;
+    }
+
+    expectedOffset += frameSize;
+    if (frameSize > largestFrame) {
+      largestFrame = frameSize;
+    }
+  }
+
+  if (expectedOffset != status.fileSize || largestFrame != status.maxFrameSize) {
+    file.close();
+    setSdmjError(status, "BAD_DATA");
+    return false;
+  }
+
+  status.dataBytes = status.fileSize - status.dataOffset;
+  status.ok = true;
+  file.close();
+  return true;
+}
+
+static void setSdraError(SdraFileStatus& status, const char* error) {
+  snprintf(status.error, sizeof(status.error), "%s", error);
+  status.ok = false;
+}
+
+static bool validateActiveRawScreensaver(SdraFileStatus& status) {
+  memset(&status, 0, sizeof(status));
+
+  if (!sdCardInitialized) {
+    setSdraError(status, "SD_NOT_READY");
+    return false;
+  }
+
+  if (!SD.exists(SCREENSAVER_ACTIVE_SDRA_PATH)) {
+    setSdraError(status, "NOT_FOUND");
+    return false;
+  }
+
+  File file = SD.open(SCREENSAVER_ACTIVE_SDRA_PATH, FILE_READ);
+  if (!file) {
+    setSdraError(status, "OPEN_FAILED");
+    return false;
+  }
+
+  status.fileSize = static_cast<uint32_t>(file.size());
+  if (status.fileSize < SDRA_HEADER_SIZE) {
+    file.close();
+    setSdraError(status, "TOO_SMALL");
+    return false;
+  }
+
+  uint8_t header[SDRA_HEADER_SIZE] = {0};
+  if (!readExact(file, header, sizeof(header))) {
+    file.close();
+    setSdraError(status, "HEADER_READ");
+    return false;
+  }
+
+  if (memcmp(header, "SDRA", 4) != 0) {
+    file.close();
+    setSdraError(status, "BAD_MAGIC");
+    return false;
+  }
+
+  uint16_t version = readLe16(header + 4);
+  uint16_t headerSize = readLe16(header + 6);
+  status.width = readLe16(header + 8);
+  status.height = readLe16(header + 10);
+  status.fps = readLe16(header + 12);
+  status.tileSize = readLe16(header + 14);
+  status.frameCount = readLe32(header + 16);
+  status.indexOffset = readLe32(header + 20);
+  status.dataOffset = readLe32(header + 24);
+  uint32_t totalSize = readLe32(header + 28);
+  status.maxFrameSize = readLe32(header + 32);
+  status.crc32 = readLe32(header + 36);
+
+  if (version != SDRA_VERSION || headerSize != SDRA_HEADER_SIZE) {
+    file.close();
+    setSdraError(status, "BAD_VERSION");
+    return false;
+  }
+
+  if (status.width != SDMJ_WIDTH || status.height != SDMJ_HEIGHT ||
+      status.fps == 0 || status.fps > 60 || status.tileSize == 0 ||
+      status.width % status.tileSize != 0 ||
+      status.height % status.tileSize != 0) {
+    file.close();
+    setSdraError(status, "BAD_GEOMETRY");
+    return false;
+  }
+
+  if (status.frameCount == 0 || status.frameCount > SDMJ_MAX_FRAME_COUNT) {
+    file.close();
+    setSdraError(status, "BAD_FRAME_COUNT");
+    return false;
+  }
+
+  status.tilesX = status.width / status.tileSize;
+  status.tilesY = status.height / status.tileSize;
+  status.fullFrameBytes =
+      static_cast<uint32_t>(status.width) * status.height * sizeof(uint16_t);
+  const uint32_t tileBytes =
+      static_cast<uint32_t>(status.tileSize) * status.tileSize * sizeof(uint16_t);
+  const uint32_t maxFullPayload = SDRA_FRAME_HEADER_SIZE + status.fullFrameBytes;
+  const uint32_t maxTilePayload =
+      SDRA_FRAME_HEADER_SIZE +
+      static_cast<uint32_t>(status.tilesX) * status.tilesY *
+          (sizeof(uint16_t) + tileBytes);
+
+  uint32_t expectedDataOffset =
+      SDRA_HEADER_SIZE + status.frameCount * SDRA_INDEX_ENTRY_SIZE;
+  if (status.indexOffset != SDRA_HEADER_SIZE ||
+      status.dataOffset != expectedDataOffset ||
+      status.dataOffset > status.fileSize ||
+      totalSize != status.fileSize ||
+      status.maxFrameSize < SDRA_FRAME_HEADER_SIZE ||
+      status.maxFrameSize > max(maxFullPayload, maxTilePayload)) {
+    file.close();
+    setSdraError(status, "BAD_OFFSETS");
+    return false;
+  }
+
+  if (!file.seek(status.indexOffset)) {
+    file.close();
+    setSdraError(status, "INDEX_SEEK");
+    return false;
+  }
+
+  uint32_t expectedOffset = status.dataOffset;
+  uint32_t largestFrame = 0;
+  for (uint32_t i = 0; i < status.frameCount; i++) {
+    uint8_t entry[SDRA_INDEX_ENTRY_SIZE] = {0};
+    if (!readExact(file, entry, sizeof(entry))) {
+      file.close();
+      setSdraError(status, "INDEX_READ");
+      return false;
+    }
+
+    uint32_t frameOffset = readLe32(entry);
+    uint32_t frameSize = readLe32(entry + 4);
+    if (frameSize < SDRA_FRAME_HEADER_SIZE || frameOffset != expectedOffset ||
+        frameOffset + frameSize > status.fileSize ||
+        frameOffset + frameSize < frameOffset ||
+        frameSize > max(maxFullPayload, maxTilePayload)) {
+      file.close();
+      setSdraError(status, "BAD_FRAME");
+      return false;
+    }
+
+    expectedOffset += frameSize;
+    if (frameSize > largestFrame) {
+      largestFrame = frameSize;
+    }
+  }
+
+  if (expectedOffset != status.fileSize || largestFrame != status.maxFrameSize) {
+    file.close();
+    setSdraError(status, "BAD_DATA");
+    return false;
+  }
+
+  status.dataBytes = status.fileSize - status.dataOffset;
+  status.ok = true;
+  file.close();
+  return true;
+}
+
+static void* allocateSdmjBuffer(size_t byteCount, bool preferInternal) {
+  if (byteCount == 0) {
+    return nullptr;
+  }
+
+  void* buffer = nullptr;
+  if (preferInternal) {
+    buffer = heap_caps_malloc(byteCount, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+
+  if (buffer == nullptr) {
+    buffer = heap_caps_malloc(byteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+
+  if (buffer == nullptr && !preferInternal) {
+    buffer = heap_caps_malloc(byteCount, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+
+  if (buffer == nullptr) {
+    buffer = malloc(byteCount);
+  }
+
+  return buffer;
+}
+
+static uint32_t elapsedUs(uint32_t startedAtUs) {
+  return static_cast<uint32_t>(micros() - startedAtUs);
+}
+
+static bool blitRgb565StripToFramebuffer(uint16_t* framebuffer,
+                                         const uint16_t* stripPixels,
+                                         uint16_t sourceWidth,
+                                         uint16_t sourceHeight,
+                                         uint16_t stripTop,
+                                         uint16_t stripHeight,
+                                         uint16_t scaleX,
+                                         uint16_t scaleY,
+                                         char* error,
+                                         size_t errorSize) {
+  if (framebuffer == nullptr || stripPixels == nullptr || sourceWidth == 0 ||
+      sourceHeight == 0 || stripHeight == 0 || scaleX == 0 || scaleY == 0 ||
+      sourceWidth * scaleX != SDMJ_WIDTH ||
+      sourceHeight * scaleY != SDMJ_HEIGHT ||
+      stripTop >= sourceHeight || stripTop + stripHeight > sourceHeight) {
+    snprintf(error, errorSize, "BLIT_GEOMETRY");
+    return false;
+  }
+
+  if (scaleX == 1 && scaleY == 1) {
+    for (uint16_t row = 0; row < stripHeight; row++) {
+      memcpy(framebuffer + (static_cast<uint32_t>(stripTop + row) * SDMJ_WIDTH),
+             stripPixels + (static_cast<uint32_t>(row) * sourceWidth),
+             static_cast<size_t>(sourceWidth) * sizeof(uint16_t));
+    }
+    return true;
+  }
+
+  for (uint16_t row = 0; row < stripHeight; row++) {
+    const uint16_t* inputRow =
+        stripPixels + (static_cast<uint32_t>(row) * sourceWidth);
+    uint16_t* firstTargetRow =
+        framebuffer +
+        (static_cast<uint32_t>(stripTop + row) * scaleY * SDMJ_WIDTH);
+
+    if (scaleX == 2) {
+      for (uint16_t column = 0; column < sourceWidth; column++) {
+        uint16_t pixel = inputRow[column];
+        firstTargetRow[column * 2] = pixel;
+        firstTargetRow[column * 2 + 1] = pixel;
+      }
+    } else {
+      for (uint16_t column = 0; column < sourceWidth; column++) {
+        uint16_t pixel = inputRow[column];
+        uint16_t* targetPixel = firstTargetRow + column * scaleX;
+        for (uint16_t repeatX = 0; repeatX < scaleX; repeatX++) {
+          targetPixel[repeatX] = pixel;
+        }
+      }
+    }
+
+    size_t scaledRowBytes =
+        static_cast<size_t>(sourceWidth) * scaleX * sizeof(uint16_t);
+    for (uint16_t repeatY = 1; repeatY < scaleY; repeatY++) {
+      memcpy(firstTargetRow + (static_cast<uint32_t>(repeatY) * SDMJ_WIDTH),
+             firstTargetRow, scaledRowBytes);
+    }
+  }
+
+  return true;
+}
+
+static bool readSdmjIndex(File& file, const SdmjFileStatus& status,
+                          SdmjFrameEntry* frames, char* error,
+                          size_t errorSize) {
+  if (frames == nullptr) {
+    snprintf(error, errorSize, "INDEX_ALLOC");
+    return false;
+  }
+
+  if (!file.seek(status.indexOffset)) {
+    snprintf(error, errorSize, "INDEX_SEEK");
+    return false;
+  }
+
+  uint8_t entry[SDMJ_INDEX_ENTRY_SIZE] = {0};
+  for (uint32_t i = 0; i < status.frameCount; i++) {
+    if (!readExact(file, entry, sizeof(entry))) {
+      snprintf(error, errorSize, "INDEX_READ");
+      return false;
+    }
+
+    frames[i].offset = readLe32(entry);
+    frames[i].size = readLe32(entry + 4);
+  }
+
+  return true;
+}
+
+static bool readSdraIndex(File& file, const SdraFileStatus& status,
+                          SdmjFrameEntry* frames, char* error,
+                          size_t errorSize) {
+  if (frames == nullptr) {
+    snprintf(error, errorSize, "INDEX_ALLOC");
+    return false;
+  }
+
+  if (!file.seek(status.indexOffset)) {
+    snprintf(error, errorSize, "INDEX_SEEK");
+    return false;
+  }
+
+  uint8_t entry[SDRA_INDEX_ENTRY_SIZE] = {0};
+  for (uint32_t i = 0; i < status.frameCount; i++) {
+    if (!readExact(file, entry, sizeof(entry))) {
+      snprintf(error, errorSize, "INDEX_READ");
+      return false;
+    }
+
+    frames[i].offset = readLe32(entry);
+    frames[i].size = readLe32(entry + 4);
+  }
+
+  return true;
+}
+
+static bool applySdraTile(uint16_t* framebuffer, const uint8_t* tilePixels,
+                          const SdraFileStatus& status, uint16_t tileIndex) {
+  if (framebuffer == nullptr || tilePixels == nullptr ||
+      tileIndex >= static_cast<uint16_t>(status.tilesX * status.tilesY)) {
+    return false;
+  }
+
+  const uint16_t tileX = tileIndex % status.tilesX;
+  const uint16_t tileY = tileIndex / status.tilesX;
+  const uint16_t tileSize = status.tileSize;
+  const uint32_t tileRowBytes = static_cast<uint32_t>(tileSize) * sizeof(uint16_t);
+  uint16_t* target =
+      framebuffer +
+      (static_cast<uint32_t>(tileY) * tileSize * status.width) +
+      (static_cast<uint32_t>(tileX) * tileSize);
+
+  for (uint16_t row = 0; row < tileSize; row++) {
+    memcpy(target + static_cast<uint32_t>(row) * status.width,
+           tilePixels + static_cast<uint32_t>(row) * tileRowBytes,
+           tileRowBytes);
+  }
+
+  return true;
+}
+
+static bool applySdraFrameToBuffer(uint16_t* framebuffer,
+                                   const uint8_t* payload,
+                                   uint32_t payloadSize,
+                                   const SdraFileStatus& status,
+                                   uint16_t flags,
+                                   uint16_t tileCount,
+                                   char* error,
+                                   size_t errorSize) {
+  if (framebuffer == nullptr || payload == nullptr ||
+      payloadSize < SDRA_FRAME_HEADER_SIZE) {
+    snprintf(error, errorSize, "BAD_PAYLOAD");
+    return false;
+  }
+
+  const uint8_t* cursor = payload + SDRA_FRAME_HEADER_SIZE;
+  const uint32_t bodySize = payloadSize - SDRA_FRAME_HEADER_SIZE;
+  const uint32_t tileBytes =
+      static_cast<uint32_t>(status.tileSize) * status.tileSize * sizeof(uint16_t);
+
+  if ((flags & SDRA_FRAME_FLAG_FULL) != 0) {
+    if (bodySize != status.fullFrameBytes) {
+      snprintf(error, errorSize, "BAD_FULL_FRAME");
+      return false;
+    }
+    memcpy(framebuffer, cursor, status.fullFrameBytes);
+    return true;
+  }
+
+  if (flags != 0) {
+    snprintf(error, errorSize, "BAD_FLAGS");
+    return false;
+  }
+
+  uint32_t expectedBodySize =
+      static_cast<uint32_t>(tileCount) * (sizeof(uint16_t) + tileBytes);
+  if (bodySize != expectedBodySize ||
+      tileCount > static_cast<uint16_t>(status.tilesX * status.tilesY)) {
+    snprintf(error, errorSize, "BAD_TILE_FRAME");
+    return false;
+  }
+
+  for (uint16_t i = 0; i < tileCount; i++) {
+    uint16_t tileIndex = readLe16(cursor);
+    cursor += sizeof(uint16_t);
+    if (!applySdraTile(framebuffer, cursor, status, tileIndex)) {
+      snprintf(error, errorSize, "BAD_TILE_INDEX");
+      return false;
+    }
+    cursor += tileBytes;
+  }
+
+  return true;
+}
+
+static bool screensaverTouchPressed() {
+  if (g_touch == nullptr) {
+    return false;
+  }
+
+  esp_panel::drivers::TouchPoint point;
+  return g_touch->readPoints(&point, 1, 0) > 0;
+}
+
+static void waitForScreensaverTouchRelease() {
+  if (g_touch == nullptr) {
+    return;
+  }
+
+  uint32_t startedAtMs = millis();
+  while (screensaverTouchPressed() && millis() - startedAtMs < 1000) {
+    delay(20);
+  }
+}
+
+static void paceSdmjFrame(uint32_t frameWorkUs, uint32_t frameIntervalUs,
+                          SdmjPlaybackStats& stats) {
+  if (frameWorkUs > stats.maxFrameWorkUs) {
+    stats.maxFrameWorkUs = frameWorkUs;
+  }
+
+  if (frameWorkUs > frameIntervalUs) {
+    stats.droppedFrames++;
+    return;
+  }
+
+  uint32_t waitUs = frameIntervalUs - frameWorkUs;
+  if (waitUs >= 2000) {
+    delay(waitUs / 1000);
+    waitUs %= 1000;
+  }
+  if (waitUs > 0) {
+    delayMicroseconds(waitUs);
+  }
+}
+
+static void restoreLvglScreenAfterSdmj() {
+  lv_obj_invalidate(lv_scr_act());
+}
+
+static void sendSdmjPlaybackStats(CdcPortId sourcePort,
+                                  const SdmjFileStatus& fileStatus,
+                                  const SdmjPlaybackStats& stats,
+                                  bool touchExit,
+                                  const char* decoderName) {
+  uint32_t fpsX100 = 0;
+  if (stats.totalPlayUs > 0) {
+    fpsX100 = static_cast<uint32_t>(
+        (static_cast<uint64_t>(stats.framesPresented) * 100000000ULL) /
+        stats.totalPlayUs);
+  }
+
+  uint64_t workUs =
+      stats.totalReadUs + stats.totalDecodeUs + stats.totalSwitchUs;
+  uint32_t rawFpsX100 = 0;
+  if (workUs > 0) {
+    rawFpsX100 = static_cast<uint32_t>(
+        (static_cast<uint64_t>(stats.framesPresented) * 100000000ULL) / workUs);
+  }
+
+  uint32_t avgReadUs = stats.framesPresented > 0
+                           ? static_cast<uint32_t>(stats.totalReadUs /
+                                                   stats.framesPresented)
+                           : 0;
+  uint32_t avgDecodeUs = stats.framesPresented > 0
+                             ? static_cast<uint32_t>(stats.totalDecodeUs /
+                                                     stats.framesPresented)
+                             : 0;
+  uint32_t avgSwitchUs = stats.framesPresented > 0
+                             ? static_cast<uint32_t>(stats.totalSwitchUs /
+                                                     stats.framesPresented)
+                             : 0;
+
+  cdcReplyToPort(
+      sourcePort,
+      "CDC:SS PLAY ok=1 format=SDMJ decoder=%s target=%u frames=%u loops=%u fps=%u.%02u raw_fps=%u.%02u dropped=%u avg_read_us=%u avg_decode_us=%u avg_switch_us=%u max_frame_us=%u total_ms=%u touch=%u",
+      decoderName != nullptr ? decoderName : "UNKNOWN", fileStatus.fps,
+      static_cast<unsigned int>(stats.framesPresented),
+      static_cast<unsigned int>(stats.loopsCompleted), fpsX100 / 100,
+      fpsX100 % 100, rawFpsX100 / 100, rawFpsX100 % 100,
+      static_cast<unsigned int>(stats.droppedFrames),
+      static_cast<unsigned int>(avgReadUs), static_cast<unsigned int>(avgDecodeUs),
+      static_cast<unsigned int>(avgSwitchUs),
+      static_cast<unsigned int>(stats.maxFrameWorkUs),
+      static_cast<unsigned int>(stats.totalPlayUs / 1000), touchExit ? 1 : 0);
+}
+
+static void sendSdraPlaybackStats(CdcPortId sourcePort,
+                                  const SdraFileStatus& fileStatus,
+                                  const SdmjPlaybackStats& stats,
+                                  bool touchExit) {
+  uint32_t fpsX100 = 0;
+  if (stats.totalPlayUs > 0) {
+    fpsX100 = static_cast<uint32_t>(
+        (static_cast<uint64_t>(stats.framesPresented) * 100000000ULL) /
+        stats.totalPlayUs);
+  }
+
+  uint64_t workUs =
+      stats.totalReadUs + stats.totalDecodeUs + stats.totalSwitchUs;
+  uint32_t rawFpsX100 = 0;
+  if (workUs > 0) {
+    rawFpsX100 = static_cast<uint32_t>(
+        (static_cast<uint64_t>(stats.framesPresented) * 100000000ULL) / workUs);
+  }
+
+  uint32_t avgReadUs = stats.framesPresented > 0
+                           ? static_cast<uint32_t>(stats.totalReadUs /
+                                                   stats.framesPresented)
+                           : 0;
+  uint32_t avgApplyUs = stats.framesPresented > 0
+                            ? static_cast<uint32_t>(stats.totalDecodeUs /
+                                                    stats.framesPresented)
+                            : 0;
+  uint32_t avgSwitchUs = stats.framesPresented > 0
+                             ? static_cast<uint32_t>(stats.totalSwitchUs /
+                                                     stats.framesPresented)
+                             : 0;
+
+  cdcReplyToPort(
+      sourcePort,
+      "CDC:SS PLAY ok=1 format=SDRA target=%u frames=%u loops=%u fps=%u.%02u raw_fps=%u.%02u dropped=%u avg_read_us=%u avg_apply_us=%u avg_switch_us=%u max_frame_us=%u total_ms=%u touch=%u",
+      fileStatus.fps, static_cast<unsigned int>(stats.framesPresented),
+      static_cast<unsigned int>(stats.loopsCompleted), fpsX100 / 100,
+      fpsX100 % 100, rawFpsX100 / 100, rawFpsX100 % 100,
+      static_cast<unsigned int>(stats.droppedFrames),
+      static_cast<unsigned int>(avgReadUs), static_cast<unsigned int>(avgApplyUs),
+      static_cast<unsigned int>(avgSwitchUs),
+      static_cast<unsigned int>(stats.maxFrameWorkUs),
+      static_cast<unsigned int>(stats.totalPlayUs / 1000), touchExit ? 1 : 0);
+}
+
+static bool playActiveRawScreensaver(CdcPortId sourcePort,
+                                     uint32_t requestedLoops,
+                                     bool exitOnTouch,
+                                     bool emitCdcStats) {
+  SdraFileStatus fileStatus;
+  if (!validateActiveRawScreensaver(fileStatus)) {
+    if (emitCdcStats) {
+      cdcReplyToPort(sourcePort, "CDC:SS PLAY ok=0 format=SDRA err=%s",
+                     fileStatus.error);
+    }
+    return false;
+  }
+
+  char error[32] = {0};
+  if (g_lcd == nullptr) {
+    snprintf(error, sizeof(error), "LCD_NOT_READY");
+  } else if (g_lcd->getFrameWidth() != SDMJ_WIDTH ||
+             g_lcd->getFrameHeight() != SDMJ_HEIGHT ||
+             g_lcd->getFrameColorBits() != 16) {
+    snprintf(error, sizeof(error), "LCD_GEOMETRY");
+  }
+
+  uint16_t* frameBuffers[2] = {nullptr, nullptr};
+  if (error[0] == '\0') {
+    frameBuffers[0] =
+        static_cast<uint16_t*>(g_lcd->getFrameBufferByIndex(0));
+    frameBuffers[1] =
+        static_cast<uint16_t*>(g_lcd->getFrameBufferByIndex(1));
+    if (frameBuffers[0] == nullptr || frameBuffers[1] == nullptr) {
+      snprintf(error, sizeof(error), "FB_UNAVAILABLE");
+    }
+  }
+
+  File file;
+  SdmjFrameEntry* frames = nullptr;
+  uint8_t* framePayload = nullptr;
+
+  if (error[0] == '\0') {
+    file = SD.open(SCREENSAVER_ACTIVE_SDRA_PATH, FILE_READ);
+    if (!file) {
+      snprintf(error, sizeof(error), "OPEN_FAILED");
+    }
+  }
+
+  if (error[0] == '\0') {
+    frames = static_cast<SdmjFrameEntry*>(
+        allocateSdmjBuffer(fileStatus.frameCount * sizeof(SdmjFrameEntry), true));
+    framePayload =
+        static_cast<uint8_t*>(allocateSdmjBuffer(fileStatus.maxFrameSize, false));
+
+    if (frames == nullptr || framePayload == nullptr) {
+      snprintf(error, sizeof(error), "ALLOC_FAILED");
+    }
+  }
+
+  if (error[0] == '\0' &&
+      !readSdraIndex(file, fileStatus, frames, error, sizeof(error))) {
+    // readSdraIndex populated error.
+  }
+
+  if (error[0] != '\0') {
+    if (file) {
+      file.close();
+    }
+    if (frames != nullptr) {
+      heap_caps_free(frames);
+    }
+    if (framePayload != nullptr) {
+      heap_caps_free(framePayload);
+    }
+    if (emitCdcStats) {
+      cdcReplyToPort(sourcePort, "CDC:SS PLAY ok=0 format=SDRA err=%s", error);
+    }
+    return false;
+  }
+
+  if (exitOnTouch) {
+    waitForScreensaverTouchRelease();
+  }
+
+  bool locked = lvgl_port_lock(-1);
+  if (!locked) {
+    file.close();
+    heap_caps_free(frames);
+    heap_caps_free(framePayload);
+    if (emitCdcStats) {
+      cdcReplyToPort(sourcePort, "CDC:SS PLAY ok=0 format=SDRA err=LVGL_LOCK");
+    }
+    return false;
+  }
+
+  SdmjPlaybackStats stats;
+  bool ok = true;
+  bool touchExit = false;
+  uint32_t activeBufferIndex = 0;
+  uint32_t frameIntervalUs = 1000000UL / fileStatus.fps;
+  uint32_t startedAtUs = micros();
+  uint32_t loopsRemaining = requestedLoops == 0 ? 0xFFFFFFFFUL : requestedLoops;
+
+  for (uint32_t loopIndex = 0; loopIndex < loopsRemaining && ok; loopIndex++) {
+    if (!file.seek(frames[0].offset)) {
+      snprintf(error, sizeof(error), "FRAME_SEEK");
+      stats.decodeErrors++;
+      ok = false;
+      break;
+    }
+
+    for (uint32_t frameIndex = 0; frameIndex < fileStatus.frameCount; frameIndex++) {
+      if (exitOnTouch && screensaverTouchPressed()) {
+        touchExit = true;
+        ok = false;
+        break;
+      }
+
+      const SdmjFrameEntry& frame = frames[frameIndex];
+      uint16_t* targetBuffer = frameBuffers[activeBufferIndex % 2];
+      uint16_t* mirrorBuffer = frameBuffers[(activeBufferIndex + 1) % 2];
+      activeBufferIndex++;
+
+      uint32_t readStartedAtUs = micros();
+      if (!file.seek(frame.offset) ||
+          file.read(framePayload, frame.size) != frame.size) {
+        snprintf(error, sizeof(error), "FRAME_READ");
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+      uint32_t readUs = elapsedUs(readStartedAtUs);
+
+      uint16_t flags = readLe16(framePayload);
+      uint16_t tileCount = readLe16(framePayload + sizeof(uint16_t));
+
+      uint32_t applyStartedAtUs = micros();
+      if (!applySdraFrameToBuffer(targetBuffer, framePayload, frame.size,
+                                  fileStatus, flags, tileCount, error,
+                                  sizeof(error))) {
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+      uint32_t targetApplyUs = elapsedUs(applyStartedAtUs);
+
+      uint32_t switchStartedAtUs = micros();
+      if (!g_lcd->switchFrameBufferTo(targetBuffer)) {
+        snprintf(error, sizeof(error), "FB_SWITCH");
+        ok = false;
+        break;
+      }
+      uint32_t switchUs = elapsedUs(switchStartedAtUs);
+
+      uint32_t mirrorApplyStartedAtUs = micros();
+      if (!applySdraFrameToBuffer(mirrorBuffer, framePayload, frame.size,
+                                  fileStatus, flags, tileCount, error,
+                                  sizeof(error))) {
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+      uint32_t applyUs = targetApplyUs + elapsedUs(mirrorApplyStartedAtUs);
+
+      stats.framesPresented++;
+      stats.totalReadUs += readUs;
+      stats.totalDecodeUs += applyUs;
+      stats.totalSwitchUs += switchUs;
+      paceSdmjFrame(readUs + applyUs + switchUs, frameIntervalUs, stats);
+    }
+
+    if (!touchExit && ok) {
+      stats.loopsCompleted++;
+    }
+  }
+
+  stats.totalPlayUs = elapsedUs(startedAtUs);
+  restoreLvglScreenAfterSdmj();
+  lvgl_port_unlock();
+
+  file.close();
+  heap_caps_free(frames);
+  heap_caps_free(framePayload);
+
+  if (touchExit) {
+    lastActivityTime = millis();
+  }
+
+  if (emitCdcStats) {
+    if (ok || touchExit) {
+      sendSdraPlaybackStats(sourcePort, fileStatus, stats, touchExit);
+    } else {
+      cdcReplyToPort(sourcePort,
+                     "CDC:SS PLAY ok=0 format=SDRA err=%s frames=%u",
+                     error[0] != '\0' ? error : "PLAY_FAILED",
+                     static_cast<unsigned int>(stats.framesPresented));
+    }
+  }
+
+  return ok || touchExit;
+}
+
+static bool playActiveScreensaverDirect(CdcPortId sourcePort,
+                                        uint32_t requestedLoops,
+                                        bool exitOnTouch,
+                                        bool emitCdcStats) {
+  SdmjFileStatus fileStatus;
+  if (!validateActiveScreensaver(fileStatus)) {
+    if (emitCdcStats) {
+      cdcReplyToPort(sourcePort, "CDC:SS PLAY ok=0 err=%s", fileStatus.error);
+    }
+    return false;
+  }
+
+  char error[32] = {0};
+  if (g_lcd == nullptr) {
+    snprintf(error, sizeof(error), "LCD_NOT_READY");
+  } else if (g_lcd->getFrameWidth() != SDMJ_WIDTH ||
+             g_lcd->getFrameHeight() != SDMJ_HEIGHT ||
+             g_lcd->getFrameColorBits() != 16) {
+    snprintf(error, sizeof(error), "LCD_GEOMETRY");
+  }
+
+  void* frameBuffers[2] = {nullptr, nullptr};
+  if (error[0] == '\0') {
+    frameBuffers[0] = g_lcd->getFrameBufferByIndex(0);
+    frameBuffers[1] = g_lcd->getFrameBufferByIndex(1);
+    if (frameBuffers[0] == nullptr || frameBuffers[1] == nullptr) {
+      snprintf(error, sizeof(error), "FB_UNAVAILABLE");
+    }
+  }
+
+  File file;
+  SdmjFrameEntry* frames = nullptr;
+  uint8_t* jpegBuffer = nullptr;
+  uint8_t* jpegBlockBuffer = nullptr;
+  jpeg_dec_handle_t jpegDecoder = nullptr;
+  uint16_t scaleX = 0;
+  uint16_t scaleY = 0;
+  bool useFullFrameDecode = false;
+
+  if (error[0] == '\0') {
+    file = SD.open(SCREENSAVER_ACTIVE_PATH, FILE_READ);
+    if (!file) {
+      snprintf(error, sizeof(error), "OPEN_FAILED");
+    }
+  }
+
+  if (error[0] == '\0') {
+    frames = static_cast<SdmjFrameEntry*>(
+        allocateSdmjBuffer(fileStatus.frameCount * sizeof(SdmjFrameEntry), true));
+    jpegBuffer =
+        static_cast<uint8_t*>(allocateSdmjBuffer(fileStatus.maxFrameSize, true));
+    useFullFrameDecode =
+        fileStatus.width == SDMJ_WIDTH && fileStatus.height == SDMJ_HEIGHT &&
+        ((reinterpret_cast<uintptr_t>(frameBuffers[0]) & 0x0F) == 0) &&
+        ((reinterpret_cast<uintptr_t>(frameBuffers[1]) & 0x0F) == 0);
+    if (!useFullFrameDecode) {
+      size_t jpegBlockBytes =
+          static_cast<size_t>(fileStatus.width) * 16 * sizeof(uint16_t);
+      jpegBlockBuffer =
+          static_cast<uint8_t*>(jpeg_calloc_align(jpegBlockBytes, 16));
+    }
+
+    jpeg_dec_config_t jpegConfig;
+    memset(&jpegConfig, 0, sizeof(jpegConfig));
+    jpegConfig.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+    jpegConfig.rotate = JPEG_ROTATE_0D;
+    jpegConfig.block_enable = !useFullFrameDecode;
+    jpeg_error_t openResult = jpeg_dec_open(&jpegConfig, &jpegDecoder);
+
+    if (frames == nullptr || jpegBuffer == nullptr ||
+        (!useFullFrameDecode && jpegBlockBuffer == nullptr) ||
+        openResult != JPEG_ERR_OK || jpegDecoder == nullptr) {
+      snprintf(error, sizeof(error), "ALLOC_FAILED");
+    }
+  }
+
+  if (error[0] == '\0' &&
+      !readSdmjIndex(file, fileStatus, frames, error, sizeof(error))) {
+    // readSdmjIndex populated error.
+  }
+
+  if (error[0] != '\0') {
+    if (file) {
+      file.close();
+    }
+    if (frames != nullptr) {
+      heap_caps_free(frames);
+    }
+    if (jpegBuffer != nullptr) {
+      heap_caps_free(jpegBuffer);
+    }
+    if (jpegBlockBuffer != nullptr) {
+      jpeg_free_align(jpegBlockBuffer);
+    }
+    if (jpegDecoder != nullptr) {
+      jpeg_dec_close(jpegDecoder);
+    }
+    if (emitCdcStats) {
+      cdcReplyToPort(sourcePort, "CDC:SS PLAY ok=0 err=%s", error);
+    }
+    return false;
+  }
+
+  if (exitOnTouch) {
+    waitForScreensaverTouchRelease();
+  }
+
+  bool locked = lvgl_port_lock(-1);
+  if (!locked) {
+    file.close();
+    heap_caps_free(frames);
+    heap_caps_free(jpegBuffer);
+    jpeg_free_align(jpegBlockBuffer);
+    jpeg_dec_close(jpegDecoder);
+    if (emitCdcStats) {
+      cdcReplyToPort(sourcePort, "CDC:SS PLAY ok=0 err=LVGL_LOCK");
+    }
+    return false;
+  }
+
+  SdmjPlaybackStats stats;
+  bool ok = true;
+  bool touchExit = false;
+  uint32_t activeBufferIndex = 0;
+  uint32_t frameIntervalUs = 1000000UL / fileStatus.fps;
+  uint32_t startedAtUs = micros();
+  uint32_t loopsRemaining = requestedLoops == 0 ? 0xFFFFFFFFUL : requestedLoops;
+  scaleX = SDMJ_WIDTH / fileStatus.width;
+  scaleY = SDMJ_HEIGHT / fileStatus.height;
+
+  for (uint32_t loopIndex = 0; loopIndex < loopsRemaining && ok; loopIndex++) {
+    if (loopIndex > 0) {
+      file.close();
+      file = SD.open(SCREENSAVER_ACTIVE_PATH, FILE_READ);
+      if (!file) {
+        snprintf(error, sizeof(error), "OPEN_FAILED");
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+    }
+
+    if (!file.seek(frames[0].offset)) {
+      snprintf(error, sizeof(error), "FRAME_SEEK");
+      stats.decodeErrors++;
+      ok = false;
+      break;
+    }
+
+    for (uint32_t frameIndex = 0; frameIndex < fileStatus.frameCount; frameIndex++) {
+      if (exitOnTouch && screensaverTouchPressed()) {
+        touchExit = true;
+        ok = false;
+        break;
+      }
+
+      const SdmjFrameEntry& frame = frames[frameIndex];
+      void* targetBuffer = frameBuffers[activeBufferIndex % 2];
+      activeBufferIndex++;
+
+      uint32_t readStartedAtUs = micros();
+      if (file.read(jpegBuffer, frame.size) != frame.size) {
+        snprintf(error, sizeof(error), "FRAME_READ");
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+      uint32_t readUs = elapsedUs(readStartedAtUs);
+
+      uint32_t decodeStartedAtUs = micros();
+      jpeg_dec_io_t jpegIo;
+      memset(&jpegIo, 0, sizeof(jpegIo));
+      jpegIo.inbuf = jpegBuffer;
+      jpegIo.inbuf_len = static_cast<int>(frame.size);
+      jpegIo.outbuf = jpegBlockBuffer;
+
+      jpeg_dec_header_info_t jpegInfo;
+      memset(&jpegInfo, 0, sizeof(jpegInfo));
+      jpeg_error_t jpegResult =
+          jpeg_dec_parse_header(jpegDecoder, &jpegIo, &jpegInfo);
+      if (jpegResult != JPEG_ERR_OK) {
+        snprintf(error, sizeof(error), "JPEG_HDR_%d", jpegResult);
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+
+      if (jpegInfo.width != fileStatus.width ||
+          jpegInfo.height != fileStatus.height) {
+        snprintf(error, sizeof(error), "JPEG_SIZE");
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+
+      int outputLen = 0;
+      jpegResult = jpeg_dec_get_outbuf_len(jpegDecoder, &outputLen);
+      if (jpegResult != JPEG_ERR_OK || outputLen <= 0 ||
+          (!useFullFrameDecode &&
+           outputLen > static_cast<int>(
+                           static_cast<size_t>(fileStatus.width) * 16 *
+                           sizeof(uint16_t))) ||
+          (useFullFrameDecode &&
+           outputLen > static_cast<int>(static_cast<size_t>(SDMJ_WIDTH) *
+                                        SDMJ_HEIGHT * sizeof(uint16_t)))) {
+        snprintf(error, sizeof(error), "JPEG_OBUF_%d", jpegResult);
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+
+      int processCount = 0;
+      jpegResult = jpeg_dec_get_process_count(jpegDecoder, &processCount);
+      if (jpegResult != JPEG_ERR_OK || processCount <= 0) {
+        snprintf(error, sizeof(error), "JPEG_COUNT_%d", jpegResult);
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+
+      const uint32_t bytesPerRow =
+          static_cast<uint32_t>(fileStatus.width) * sizeof(uint16_t);
+      if (useFullFrameDecode) {
+        jpegIo.outbuf = static_cast<uint8_t*>(targetBuffer);
+        jpegIo.out_size = 0;
+        jpegResult = jpeg_dec_process(jpegDecoder, &jpegIo);
+        if (jpegResult != JPEG_ERR_OK ||
+            jpegIo.out_size != outputLen ||
+            outputLen != static_cast<int>(static_cast<size_t>(SDMJ_WIDTH) *
+                                          SDMJ_HEIGHT * sizeof(uint16_t))) {
+          snprintf(error, sizeof(error), "JPEG_DEC_%d", jpegResult);
+          stats.decodeErrors++;
+          ok = false;
+          break;
+        }
+      } else {
+        uint16_t stripTop = 0;
+      uint8_t* directFrameOutput =
+          (scaleX == 1 && scaleY == 1)
+              ? static_cast<uint8_t*>(targetBuffer)
+              : nullptr;
+      for (int blockIndex = 0; blockIndex < processCount; blockIndex++) {
+        jpegIo.outbuf =
+            directFrameOutput != nullptr
+                ? directFrameOutput +
+                      static_cast<uint32_t>(stripTop) * bytesPerRow
+                : jpegBlockBuffer;
+        jpegIo.out_size = 0;
+        jpegResult = jpeg_dec_process(jpegDecoder, &jpegIo);
+        if (jpegResult != JPEG_ERR_OK) {
+          snprintf(error, sizeof(error), "JPEG_DEC_%d", jpegResult);
+          stats.decodeErrors++;
+          ok = false;
+          break;
+        }
+
+        if (jpegIo.out_size <= 0 ||
+            (static_cast<uint32_t>(jpegIo.out_size) % bytesPerRow) != 0) {
+          snprintf(error, sizeof(error), "JPEG_STRIP");
+          stats.decodeErrors++;
+          ok = false;
+          break;
+        }
+
+        uint16_t stripHeight =
+            static_cast<uint16_t>(jpegIo.out_size / bytesPerRow);
+        if (directFrameOutput == nullptr) {
+          if (!blitRgb565StripToFramebuffer(
+                  static_cast<uint16_t*>(targetBuffer),
+                  reinterpret_cast<const uint16_t*>(jpegBlockBuffer),
+                  fileStatus.width, fileStatus.height, stripTop, stripHeight,
+                  scaleX, scaleY, error, sizeof(error))) {
+            stats.decodeErrors++;
+            ok = false;
+            break;
+          }
+        }
+        stripTop += stripHeight;
+      }
+
+      if (!ok) {
+        break;
+      }
+
+      if (stripTop != fileStatus.height) {
+        snprintf(error, sizeof(error), "JPEG_ROWS");
+        stats.decodeErrors++;
+        ok = false;
+        break;
+      }
+      }
+      uint32_t decodeUs = elapsedUs(decodeStartedAtUs);
+
+      uint32_t switchStartedAtUs = micros();
+      if (!g_lcd->switchFrameBufferTo(targetBuffer)) {
+        snprintf(error, sizeof(error), "FB_SWITCH");
+        ok = false;
+        break;
+      }
+      uint32_t switchUs = elapsedUs(switchStartedAtUs);
+
+      stats.framesPresented++;
+      stats.totalReadUs += readUs;
+      stats.totalDecodeUs += decodeUs;
+      stats.totalSwitchUs += switchUs;
+      paceSdmjFrame(readUs + decodeUs + switchUs, frameIntervalUs, stats);
+    }
+
+    if (!touchExit && ok) {
+      stats.loopsCompleted++;
+    }
+  }
+
+  stats.totalPlayUs = elapsedUs(startedAtUs);
+  restoreLvglScreenAfterSdmj();
+  lvgl_port_unlock();
+
+  file.close();
+  heap_caps_free(frames);
+  heap_caps_free(jpegBuffer);
+  jpeg_free_align(jpegBlockBuffer);
+  jpeg_dec_close(jpegDecoder);
+
+  if (touchExit) {
+    lastActivityTime = millis();
+  }
+
+  if (emitCdcStats) {
+    if (ok || touchExit) {
+      sendSdmjPlaybackStats(sourcePort, fileStatus, stats, touchExit,
+                            useFullFrameDecode ? "ESP_NEW_JPEG_FULL"
+                                               : "ESP_NEW_JPEG_BLOCK");
+    } else {
+      cdcReplyToPort(sourcePort, "CDC:SS PLAY ok=0 err=%s frames=%u",
+                     error[0] != '\0' ? error : "PLAY_FAILED",
+                     static_cast<unsigned int>(stats.framesPresented));
+    }
+  }
+
+  return ok || touchExit;
+}
+
+static bool playActiveScreensaver(CdcPortId sourcePort,
+                                  uint32_t requestedLoops,
+                                  bool exitOnTouch,
+                                  bool emitCdcStats) {
+  if (sdCardInitialized && SD.exists(SCREENSAVER_ACTIVE_PATH)) {
+    return playActiveScreensaverDirect(sourcePort, requestedLoops, exitOnTouch,
+                                       emitCdcStats);
+  }
+
+  return playActiveRawScreensaver(sourcePort, requestedLoops, exitOnTouch,
+                                  emitCdcStats);
 }
 
 static void clearMacroConfig() {
@@ -1072,10 +2369,16 @@ static void tickMacroExecutor() {
 
 static void resetCdcUploadState() {
   g_cdcUpload.active = false;
+  g_cdcUpload.chunked = false;
   g_cdcUpload.targetPath[0] = '\0';
   g_cdcUpload.tempPath[0] = '\0';
   g_cdcUpload.expectedBytes = 0;
   g_cdcUpload.receivedBytes = 0;
+  g_cdcUpload.chunkHeader[0] = 0;
+  g_cdcUpload.chunkHeader[1] = 0;
+  g_cdcUpload.chunkHeaderBytes = 0;
+  g_cdcUpload.currentChunkSize = 0;
+  g_cdcUpload.currentChunkBytes = 0;
   g_cdcUpload.lastDataMs = 0;
   g_cdcUpload.sourcePort = static_cast<uint8_t>(CdcPortId::SerialPort);
 }
@@ -1084,7 +2387,14 @@ static CdcPortId activeUploadPortId() {
   return static_cast<CdcPortId>(g_cdcUpload.sourcePort);
 }
 
+static const char* activeUploadVerb() {
+  return g_cdcUpload.chunked ? "PUTC" : "PUT";
+}
+
 static void abortCdcUpload(const char* reason) {
+  CdcPortId sourcePort = activeUploadPortId();
+  const char* verb = activeUploadVerb();
+
   if (g_cdcUpload.file) {
     g_cdcUpload.file.close();
   }
@@ -1093,7 +2403,7 @@ static void abortCdcUpload(const char* reason) {
     SD.remove(g_cdcUpload.tempPath);
   }
 
-  cdcReplyToPort(activeUploadPortId(), "CDC:ERR PUT %s", reason);
+  cdcReplyToPort(sourcePort, "CDC:ERR %s %s", verb, reason);
   resetCdcUploadState();
 }
 
@@ -1110,12 +2420,13 @@ static void finishCdcUpload() {
   }
 
   CdcPortId sourcePort = activeUploadPortId();
+  const char* verb = activeUploadVerb();
 
   if (strcmp(g_cdcUpload.targetPath, MACRO_CONFIG_PATH) == 0) {
     loadMacroConfigFromSD();
   }
 
-  cdcReplyToPort(sourcePort, "CDC:OK PUT %s %u", g_cdcUpload.targetPath,
+  cdcReplyToPort(sourcePort, "CDC:OK %s %s %u", verb, g_cdcUpload.targetPath,
                  static_cast<unsigned int>(g_cdcUpload.receivedBytes));
 
   if (strcmp(g_cdcUpload.targetPath, MACRO_CONFIG_PATH) == 0) {
@@ -1128,7 +2439,7 @@ static void finishCdcUpload() {
 }
 
 static void beginCdcUpload(CdcPortId sourcePort, const char* targetPath,
-                           size_t expectedBytes) {
+                           size_t expectedBytes, bool chunked) {
   if (!sdCardInitialized) {
     cdcReplyToPort(sourcePort, "CDC:ERR SD_NOT_READY");
     return;
@@ -1144,7 +2455,7 @@ static void beginCdcUpload(CdcPortId sourcePort, const char* targetPath,
     return;
   }
 
-  if (expectedBytes == 0 || expectedBytes > 1024 * 1024) {
+  if (expectedBytes == 0 || expectedBytes > CDC_MAX_TRANSFER_BYTES) {
     cdcReplyToPort(sourcePort, "CDC:ERR INVALID_SIZE");
     return;
   }
@@ -1160,6 +2471,11 @@ static void beginCdcUpload(CdcPortId sourcePort, const char* targetPath,
     SD.remove(g_cdcUpload.tempPath);
   }
 
+  if (isScreensaverAssetPath(g_cdcUpload.targetPath) &&
+      !SD.exists(SCREENSAVER_DIR_PATH)) {
+    SD.mkdir(SCREENSAVER_DIR_PATH);
+  }
+
   g_cdcUpload.file = SD.open(g_cdcUpload.tempPath, FILE_WRITE);
   if (!g_cdcUpload.file) {
     resetCdcUploadState();
@@ -1168,11 +2484,13 @@ static void beginCdcUpload(CdcPortId sourcePort, const char* targetPath,
   }
 
   g_cdcUpload.active = true;
+  g_cdcUpload.chunked = chunked;
   g_cdcUpload.receivedBytes = 0;
   g_cdcUpload.lastDataMs = millis();
   g_cdcUpload.sourcePort = static_cast<uint8_t>(sourcePort);
 
-  cdcReplyToPort(sourcePort, "CDC:READY PUT %s %u", g_cdcUpload.targetPath,
+  cdcReplyToPort(sourcePort, "CDC:READY %s %s %u",
+                 chunked ? "PUTC" : "PUT", g_cdcUpload.targetPath,
                  static_cast<unsigned int>(g_cdcUpload.expectedBytes));
 }
 
@@ -1236,7 +2554,7 @@ static void beginCdcDownload(CdcPortId sourcePort, const char* targetPath) {
   }
 
   size_t fileSize = file.size();
-  if (fileSize > 1024 * 1024) {
+  if (fileSize > CDC_MAX_TRANSFER_BYTES) {
     file.close();
     cdcReplyToPort(sourcePort, "CDC:ERR GET INVALID_SIZE");
     return;
@@ -1257,6 +2575,44 @@ static void beginCdcDownload(CdcPortId sourcePort, const char* targetPath) {
                  static_cast<unsigned int>(fileSize));
 }
 
+static void sendScreensaverStatus(CdcPortId sourcePort) {
+  if (sdCardInitialized && SD.exists(SCREENSAVER_ACTIVE_PATH)) {
+    SdmjFileStatus status;
+    if (!validateActiveScreensaver(status)) {
+      cdcReplyToPort(sourcePort, "CDC:SS STATUS ok=0 format=SDMJ file=%s err=%s",
+                     SCREENSAVER_ACTIVE_PATH, status.error);
+      return;
+    }
+
+    cdcReplyToPort(
+        sourcePort,
+        "CDC:SS STATUS ok=1 format=SDMJ file=%s bytes=%u frames=%u width=%u height=%u fps=%u max_frame=%u data=%u crc=%08X",
+        SCREENSAVER_ACTIVE_PATH, static_cast<unsigned int>(status.fileSize),
+        static_cast<unsigned int>(status.frameCount), status.width, status.height,
+        status.fps, static_cast<unsigned int>(status.maxFrameSize),
+        static_cast<unsigned int>(status.dataBytes),
+        static_cast<unsigned int>(status.crc32));
+    return;
+  }
+
+  SdraFileStatus rawStatus;
+  if (!validateActiveRawScreensaver(rawStatus)) {
+    cdcReplyToPort(sourcePort, "CDC:SS STATUS ok=0 format=SDRA file=%s err=%s",
+                   SCREENSAVER_ACTIVE_SDRA_PATH, rawStatus.error);
+    return;
+  }
+
+  cdcReplyToPort(
+      sourcePort,
+      "CDC:SS STATUS ok=1 format=SDRA file=%s bytes=%u frames=%u width=%u height=%u fps=%u tile=%u max_frame=%u data=%u crc=%08X",
+      SCREENSAVER_ACTIVE_SDRA_PATH, static_cast<unsigned int>(rawStatus.fileSize),
+      static_cast<unsigned int>(rawStatus.frameCount), rawStatus.width,
+      rawStatus.height, rawStatus.fps, rawStatus.tileSize,
+      static_cast<unsigned int>(rawStatus.maxFrameSize),
+      static_cast<unsigned int>(rawStatus.dataBytes),
+      static_cast<unsigned int>(rawStatus.crc32));
+}
+
 static void handleCdcCommand(CdcPortId sourcePort, const char* line) {
   if (line == nullptr || line[0] == '\0') {
     return;
@@ -1269,7 +2625,7 @@ static void handleCdcCommand(CdcPortId sourcePort, const char* line) {
 
   if (equalsIgnoreCase(line, "HELP")) {
     cdcReplyToPort(sourcePort,
-                   "CDC:CMDS PING|STATUS|RELOAD <MACROS|ICONS|ALL>|PUT <path> <size>|GET <path>");
+                   "CDC:CMDS PING|STATUS|SS STATUS|SS PLAY [loops]|RELOAD <MACROS|ICONS|ALL>|PUT <path> <size>|PUTC <path> <size>|GET <path>");
     return;
   }
 
@@ -1288,9 +2644,39 @@ static void handleCdcCommand(CdcPortId sourcePort, const char* line) {
     }
 
     cdcReplyToPort(sourcePort,
-                   "CDC:STATUS sd=%d usb=%d macros=%d radial=%d active=%d events=1 proto=3",
+                   "CDC:STATUS sd=%d usb=%d macros=%d radial=%d active=%d events=1 proto=5",
                    sdCardInitialized ? 1 : 0, usbKeyboardReady ? 1 : 0,
                    configuredIcons, configuredRadialItems, g_macroExecutor.active ? 1 : 0);
+    return;
+  }
+
+  if (equalsIgnoreCase(line, "SS STATUS")) {
+    sendScreensaverStatus(sourcePort);
+    return;
+  }
+
+  if (startsWithIgnoreCase(line, "SS PLAY")) {
+    const char* loopsArg = line + 7;
+    while (*loopsArg == ' ') {
+      loopsArg++;
+    }
+
+    uint32_t loops = 1;
+    if (*loopsArg != '\0') {
+      char* endPtr = nullptr;
+      unsigned long parsedLoops = strtoul(loopsArg, &endPtr, 10);
+      while (endPtr != nullptr && *endPtr == ' ') {
+        endPtr++;
+      }
+      if (endPtr == nullptr || *endPtr != '\0' || parsedLoops == 0 ||
+          parsedLoops > 1000) {
+        cdcReplyToPort(sourcePort, "CDC:ERR SS_PLAY_LOOPS");
+        return;
+      }
+      loops = static_cast<uint32_t>(parsedLoops);
+    }
+
+    playActiveScreensaver(sourcePort, loops, false, true);
     return;
   }
 
@@ -1324,7 +2710,19 @@ static void handleCdcCommand(CdcPortId sourcePort, const char* line) {
       return;
     }
 
-    beginCdcUpload(sourcePort, path, static_cast<size_t>(uploadSize));
+    beginCdcUpload(sourcePort, path, static_cast<size_t>(uploadSize), false);
+    return;
+  }
+
+  if (startsWithIgnoreCase(line, "PUTC ")) {
+    char path[64] = {0};
+    unsigned long uploadSize = 0;
+    if (sscanf(line, "PUTC %63s %lu", path, &uploadSize) != 2) {
+      cdcReplyToPort(sourcePort, "CDC:ERR PUTC_SYNTAX");
+      return;
+    }
+
+    beginCdcUpload(sourcePort, path, static_cast<size_t>(uploadSize), true);
     return;
   }
 
@@ -1347,12 +2745,94 @@ static bool uploadBelongsToPort(CdcPortId portId) {
          (static_cast<CdcPortId>(g_cdcUpload.sourcePort) == portId);
 }
 
+static void processChunkedCdcUpload(Stream* inputStream) {
+  uint8_t chunk[CDC_UPLOAD_BUFFER_BYTES];
+
+  while (inputStream->available() > 0 && g_cdcUpload.active) {
+    if (g_cdcUpload.chunkHeaderBytes < sizeof(g_cdcUpload.chunkHeader)) {
+      int rawByte = inputStream->read();
+      if (rawByte < 0) {
+        break;
+      }
+
+      g_cdcUpload.chunkHeader[g_cdcUpload.chunkHeaderBytes++] =
+          static_cast<uint8_t>(rawByte);
+      g_cdcUpload.lastDataMs = millis();
+
+      if (g_cdcUpload.chunkHeaderBytes < sizeof(g_cdcUpload.chunkHeader)) {
+        continue;
+      }
+
+      g_cdcUpload.currentChunkSize = readLe16(g_cdcUpload.chunkHeader);
+      g_cdcUpload.currentChunkBytes = 0;
+
+      size_t remaining =
+          g_cdcUpload.expectedBytes - g_cdcUpload.receivedBytes;
+      if (g_cdcUpload.currentChunkSize == 0 ||
+          g_cdcUpload.currentChunkSize > sizeof(chunk) ||
+          g_cdcUpload.currentChunkSize > remaining) {
+        abortCdcUpload("BAD_CHUNK");
+        break;
+      }
+
+      if (inputStream->available() <= 0) {
+        continue;
+      }
+    }
+
+    size_t chunkRemaining =
+        g_cdcUpload.currentChunkSize - g_cdcUpload.currentChunkBytes;
+    size_t toRead = static_cast<size_t>(inputStream->available());
+    if (toRead > chunkRemaining) {
+      toRead = chunkRemaining;
+    }
+    if (toRead > sizeof(chunk)) {
+      toRead = sizeof(chunk);
+    }
+
+    size_t bytesRead =
+        inputStream->readBytes(reinterpret_cast<char*>(chunk), toRead);
+    if (bytesRead == 0) {
+      break;
+    }
+
+    size_t bytesWritten = g_cdcUpload.file.write(chunk, bytesRead);
+    if (bytesWritten != bytesRead) {
+      abortCdcUpload("WRITE_FAILED");
+      break;
+    }
+
+    g_cdcUpload.currentChunkBytes += bytesWritten;
+    g_cdcUpload.receivedBytes += bytesWritten;
+    g_cdcUpload.lastDataMs = millis();
+
+    if (g_cdcUpload.currentChunkBytes >= g_cdcUpload.currentChunkSize) {
+      g_cdcUpload.chunkHeaderBytes = 0;
+      g_cdcUpload.currentChunkSize = 0;
+      g_cdcUpload.currentChunkBytes = 0;
+
+      if (g_cdcUpload.receivedBytes >= g_cdcUpload.expectedBytes) {
+        finishCdcUpload();
+        break;
+      }
+
+      cdcReplyToPort(activeUploadPortId(), "CDC:ACK PUTC %u",
+                     static_cast<unsigned int>(g_cdcUpload.receivedBytes));
+    }
+  }
+}
+
 static void processCdcInputForPort(CdcPortId portId, Stream* inputStream,
                                    char* lineBuffer,
                                    size_t* lineLength) {
   while (inputStream->available() > 0) {
     if (uploadBelongsToPort(portId)) {
-      uint8_t chunk[256];
+      if (g_cdcUpload.chunked) {
+        processChunkedCdcUpload(inputStream);
+        continue;
+      }
+
+      uint8_t chunk[CDC_UPLOAD_BUFFER_BYTES];
       size_t remaining = g_cdcUpload.expectedBytes - g_cdcUpload.receivedBytes;
       size_t toRead = static_cast<size_t>(inputStream->available());
       if (toRead > remaining) {
@@ -1452,6 +2932,24 @@ void activateScreensaver() {
   if (isScreensaverActive) return;
 
   Serial.println("Activating screensaver");
+
+  if (sdCardInitialized &&
+      (SD.exists(SCREENSAVER_ACTIVE_SDRA_PATH) ||
+       SD.exists(SCREENSAVER_ACTIVE_PATH))) {
+    if (expander != nullptr) {
+      expander->digitalWrite(LCD_BL, HIGH);
+    }
+
+    isScreensaverActive = true;
+    bool played = playActiveScreensaver(CdcPortId::SerialPort, 0, true, false);
+    isScreensaverActive = false;
+    if (played) {
+      Serial.println("Screensaver playback exited");
+      return;
+    }
+
+    Serial.println("Animated screensaver unavailable, falling back to blank screen");
+  }
 
   // Turn off backlight to save power
   if (expander != nullptr) {
@@ -2117,7 +3615,7 @@ bool initSDCard(esp_expander::Base* expander) {
   SPI.setHwCs(false);
   SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_SS);
 
-  if (!SD.begin(SD_SS)) {
+  if (!SD.begin(SD_SS, SPI, SD_SPI_FREQUENCY_HZ)) {
     return false;
   }
 
@@ -2152,6 +3650,7 @@ void setup() {
   if (lcd == nullptr) {
     haltWithError("Board LCD handle missing");
   }
+  g_lcd = lcd;
 
 #if LVGL_PORT_AVOID_TEAR
   // Framebuffer count for avoid-tear mode
@@ -2171,6 +3670,7 @@ void setup() {
   if (!panel->begin()) {
     haltWithError("Board begin failed");
   }
+  g_touch = panel->getTouch();
 
   auto ioExpander = panel->getIO_Expander();
   if (ioExpander == nullptr || ioExpander->getBase() == nullptr) {
@@ -2181,7 +3681,7 @@ void setup() {
   // Configure EXIO pins used by app peripherals
   expander->pinMode(SD_CS, OUTPUT);
 
-  if (!lvgl_port_init(panel->getLCD(), panel->getTouch())) {
+  if (!lvgl_port_init(g_lcd, g_touch)) {
     haltWithError("LVGL port init failed");
   }
 
@@ -2201,7 +3701,7 @@ void setup() {
   rebuildGridUI();
 
   // Set up touch event handler for screensaver
-  setupScreensaverTouchEvents(panel->getTouch());
+  setupScreensaverTouchEvents(g_touch);
 
   Serial.println("Setup complete!");
 }

@@ -1,4 +1,12 @@
 {
+  "scripts": {
+    "fw:build": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/pio.ps1 run",
+    "fw:upload": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/pio.ps1 run --target upload",
+    "fw:monitor": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/pio.ps1 device monitor",
+    "fw:pio": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/pio.ps1",
+    "ss:convert:sample": "python tools/make_sdmj.py --input \"lucy gif small01687971.gif\" --output build/screensaver/active.sdmj --width 200 --height 120 --quality 2",
+    "ss:convert:raw": "python tools/make_sdra.py --input \"lucy gif small01687971.gif\" --output build/screensaver/active.sdra"
+  },
   "dependencies": {
     "requirements": "^4.0.2"
   }

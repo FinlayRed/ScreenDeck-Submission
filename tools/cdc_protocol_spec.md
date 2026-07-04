@@ -10,8 +10,8 @@ The protocol allows a desktop app (or test script) to:
 
 - query device status,
 - trigger live reloads,
-- upload `macros.json`, home icon assets, and radial icon assets to SD,
-- download `macros.json`, home icon assets, and radial icon assets from SD,
+- upload `macros.json`, home icon assets, radial icon assets, and the active screensaver to SD,
+- download `macros.json`, home icon assets, radial icon assets, and the active screensaver from SD,
 - apply changes without reboot.
 
 ## 2) Transport and USB mode
@@ -38,7 +38,8 @@ Notes:
 
 ### 3.2 Upload framing
 
-- `PUT` begins a binary data phase.
+- `PUT` begins an unacknowledged binary data phase.
+- `PUTC` begins an acknowledged chunked binary data phase.
 - After `CDC:READY ...`, host must send exactly `<size>` raw bytes.
 - No checksum or delimiter is currently required after binary payload.
 
@@ -63,13 +64,7 @@ CDC:PONG
 Response format:
 
 ```text
-CDC:CMDS PING|STATUS|RELOAD <MACROS|ICONS|ALL>|PUT <path> <size>
-```
-
-Current firmware extends this with:
-
-```text
-CDC:CMDS PING|STATUS|RELOAD <MACROS|ICONS|ALL>|PUT <path> <size>|GET <path>
+CDC:CMDS PING|STATUS|SS STATUS|SS PLAY [loops]|RELOAD <MACROS|ICONS|ALL>|PUT <path> <size>|PUTC <path> <size>|GET <path>
 ```
 
 ## 4.3 `STATUS`
@@ -77,7 +72,7 @@ CDC:CMDS PING|STATUS|RELOAD <MACROS|ICONS|ALL>|PUT <path> <size>|GET <path>
 Response format:
 
 ```text
-CDC:STATUS sd=<0|1> usb=<0|1> macros=<int> radial=<int> active=<0|1> events=1 proto=3
+CDC:STATUS sd=<0|1> usb=<0|1> macros=<int> radial=<int> active=<0|1> events=1 proto=5
 ```
 
 Field meaning:
@@ -131,7 +126,42 @@ Then firmware applies updates:
 - `/macros.json` -> reloads macro config and emits `CDC:INFO RELOAD MACROS`
 - icon/fallback/radial asset -> stores the file and emits `CDC:INFO ICON STORED`; send `RELOAD ICONS` or `RELOAD ALL` to rebuild the grid
 
-## 4.6 `GET <path>`
+## 4.6 `PUTC <path> <size>`
+
+`PUTC` is the recommended upload command for screensavers and other large files. It uses the same target paths and temp-file semantics as `PUT`, but flow-controls the transfer.
+
+Syntax:
+
+```text
+PUTC /screensavers/active.sdmj 1234
+```
+
+When accepted:
+
+```text
+CDC:READY PUTC /screensavers/active.sdmj 1234
+```
+
+For each chunk, host sends:
+
+```text
+uint16_le chunk_size
+<chunk_size raw bytes>
+```
+
+After each non-final chunk:
+
+```text
+CDC:ACK PUTC <received_bytes>
+```
+
+After receiving exactly `size` bytes:
+
+```text
+CDC:OK PUTC /screensavers/active.sdmj 1234
+```
+
+## 4.7 `GET <path>`
 
 Syntax:
 
@@ -165,6 +195,8 @@ Only these paths are accepted:
 - `/fallback.bin`
 - `/icon_<row>_<col>.bin` where `row` is `0..3`, `col` is `0..7`
 - `/radial_<row>_<col>_<direction>.bin` where `direction` is `n`, `e`, `s`, or `w`
+- `/screensavers/active.sdmj`
+- `/screensavers/active.sdra`
 
 Anything else returns:
 
@@ -174,7 +206,7 @@ CDC:ERR PATH_NOT_ALLOWED
 
 ## 6) Size and timeout limits
 
-- Upload size range: `1..1048576` bytes (`1 MB`).
+- Upload size range: `1..67108864` bytes (`64 MB`).
 - Upload idle timeout: `30000 ms`.
 - Command line buffer length: 159 chars usable (160 with null terminator).
 
@@ -193,14 +225,14 @@ States:
 
 Transitions:
 
-- `Idle` + valid `PUT` -> open temp file, emit `CDC:READY...`, enter `Uploading`.
+- `Idle` + valid `PUT` or `PUTC` -> open temp file, emit `CDC:READY...`, enter `Uploading`.
 - `Uploading` + receive bytes until expected count -> close + rename, emit `CDC:OK...`, auto-apply, return to `Idle`.
-- `Uploading` + timeout/write/rename failure -> emit `CDC:ERR PUT ...`, cleanup temp, return to `Idle`.
+- `Uploading` + timeout/write/rename failure -> emit `CDC:ERR PUT ...` or `CDC:ERR PUTC ...`, cleanup temp, return to `Idle`.
 
 Important behavior:
 
-- While in `Uploading`, all incoming bytes are treated as payload (not commands).
-- A second `PUT` during active upload returns:
+- While in `Uploading`, all incoming bytes are treated as payload/chunk framing (not commands).
+- A second `PUT` or `PUTC` during active upload returns:
 
 ```text
 CDC:ERR UPLOAD_ALREADY_ACTIVE
@@ -228,6 +260,7 @@ On failure, temp file is deleted.
 - `CDC:ERR UNKNOWN_CMD`
 - `CDC:ERR RELOAD_TARGET`
 - `CDC:ERR PUT_SYNTAX`
+- `CDC:ERR PUTC_SYNTAX`
 - `CDC:ERR SD_NOT_READY`
 - `CDC:ERR UPLOAD_ALREADY_ACTIVE`
 - `CDC:ERR PATH_NOT_ALLOWED`
@@ -237,6 +270,10 @@ On failure, temp file is deleted.
 - `CDC:ERR PUT TIMEOUT`
 - `CDC:ERR PUT WRITE_FAILED`
 - `CDC:ERR PUT RENAME_FAILED`
+- `CDC:ERR PUTC TIMEOUT`
+- `CDC:ERR PUTC BAD_CHUNK`
+- `CDC:ERR PUTC WRITE_FAILED`
+- `CDC:ERR PUTC RENAME_FAILED`
 - `CDC:ERR GET_SYNTAX`
 - `CDC:ERR GET NOT_FOUND`
 - `CDC:ERR GET OPEN_FAILED`
@@ -247,35 +284,80 @@ On failure, temp file is deleted.
 
 - Always wait for `CDC:READY ...` before sending binary payload.
 - Send exactly `size` bytes, no more/no less.
+- Use `PUTC` for screensavers and other large files; use `PUT` only for small files or compatibility with older firmware.
 - Treat responses as line-oriented UTF-8 text.
 - Re-open/re-scan COM port if USB re-enumerates.
 - Close other serial monitors before transfer.
 
 Recommended upload sequence for batch updates:
 
-1. `PUT` each changed file.
-2. Wait for each `CDC:OK PUT ...`.
+1. `PUTC` each changed large file/screensaver, or `PUT` small compatibility files.
+2. Wait for each `CDC:OK PUTC ...` or `CDC:OK PUT ...`.
 3. Optionally send `RELOAD ALL` when done.
 
 ## 11) Protocol grammar (informal)
 
 ```text
-command     = ping / help / status / reload / put / get
+command     = ping / help / status / ss_status / ss_play / reload / put / putc / get
 ping        = "PING"
 help        = "HELP"
 status      = "STATUS"
+ss_status   = "SS" SP "STATUS"
+ss_play     = "SS" SP "PLAY" [ SP loops ]
 reload      = "RELOAD" SP target
 target      = "MACROS" / "ICONS" / "ALL"
 put         = "PUT" SP path SP size
+putc        = "PUTC" SP path SP size
 get         = "GET" SP path
-path        = "/macros.json" / "/fallback.bin" / "/icon_" row "_" col ".bin" / "/radial_" row "_" col "_" direction ".bin"
+path        = "/macros.json" / "/fallback.bin" / "/screensavers/active.sdmj" / "/screensavers/active.sdra" / "/icon_" row "_" col ".bin" / "/radial_" row "_" col "_" direction ".bin"
 row         = "0" / "1" / "2" / "3"
 col         = "0" / "1" / "2" / "3" / "4" / "5" / "6" / "7"
 direction   = "n" / "e" / "s" / "w"
-size        = 1*DIGIT ; decimal integer 1..1048576
+size        = 1*DIGIT ; decimal integer 1..67108864
+loops       = 1*DIGIT ; decimal integer 1..1000
 ```
 
-## 12) Macro config radial schema
+## 12) Screensaver status
+
+`SS STATUS` validates `/screensavers/active.sdmj` when present. If it is missing, firmware falls back to `/screensavers/active.sdra`.
+
+Success:
+
+```text
+CDC:SS STATUS ok=1 format=SDMJ file=/screensavers/active.sdmj bytes=123456 frames=150 width=200 height=120 fps=15 max_frame=1234 data=120000 crc=89ABCDEF
+```
+
+Failure:
+
+```text
+CDC:SS STATUS ok=0 file=/screensavers/active.sdmj err=NOT_FOUND
+```
+
+The `.sdmj` format is documented in `tools/sdmj_format.md`. The firmware accepts SDMJ frames whose dimensions divide evenly into the `800x480` framebuffer and upscales them directly. The measured profile for this board is `200x120`, `15 fps`, `q=2`.
+
+## 13) Screensaver playback benchmark
+
+`SS PLAY [loops]` plays `/screensavers/active.sdmj` through the direct LCD framebuffer path. `loops` defaults to `1`.
+
+Success:
+
+```text
+CDC:SS PLAY ok=1 format=SDMJ target=15 frames=110 loops=5 fps=14.99 raw_fps=16.70 dropped=0 avg_read_us=5773 avg_decode_us=54057 avg_switch_us=26 max_frame_us=62250 total_ms=7336 touch=0
+```
+
+Failure:
+
+```text
+CDC:SS PLAY ok=0 err=JPEG_DEC_6 frames=3
+```
+
+Fields:
+
+- `fps`: paced playback rate including frame delays.
+- `raw_fps`: throughput without pacing delay, based on read + decode + switch time.
+- `dropped`: frames whose read/decode/switch work exceeded the target frame interval.
+
+## 14) Macro config radial schema
 
 `macros.json` version `2` adds optional radial menu config. Firmware still accepts version `1` files.
 
@@ -312,7 +394,7 @@ CDC:EVENT BUTTON <index> <row> <col>
 CDC:EVENT RADIAL <index> <row> <col> <direction>
 ```
 
-## 13) Current non-goals / known gaps
+## 15) Current non-goals / known gaps
 
 - No authentication/authorization.
 - No payload checksum/CRC.
@@ -320,14 +402,14 @@ CDC:EVENT RADIAL <index> <row> <col> <direction>
 - No multipart/batch transaction command.
 - No explicit protocol version handshake.
 
-## 14) Example session
+## 16) Example session
 
 ```text
 > PING
 < CDC:PONG
 
 > STATUS
-< CDC:STATUS sd=1 usb=1 macros=5 radial=2 active=0 events=1 proto=3
+< CDC:STATUS sd=1 usb=1 macros=5 radial=2 active=0 events=1 proto=5
 
 > PUT /icon_0_0.bin 14450
 < CDC:READY PUT /icon_0_0.bin 14450

@@ -5,7 +5,7 @@ use serialport::{ClearBuffer, SerialPort, SerialPortInfo, SerialPortType};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,17 +19,19 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 const GRID_ROWS: u8 = 4;
 const GRID_COLS: u8 = 8;
 const ICON_BYTE_SIZE: usize = 85 * 85 * 2;
-const MAX_UPLOAD_BYTES: usize = 1024 * 1024;
+const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 const HANDSHAKE_TOTAL_TIMEOUT_MS: u64 = 20000;
 const PROBE_HANDSHAKE_TIMEOUT_MS: u64 = 8000;
 const PORT_SETTLE_MS: u64 = 1000;
-const UPLOAD_CHUNK_SIZE: usize = 32;
+const UPLOAD_CHUNK_SIZE: usize = 512;
+const ACKED_UPLOAD_CHUNK_SIZE: usize = 1024;
+const ACKED_UPLOAD_PROGRESS_STEP: usize = 64 * 1024;
 const UPLOAD_INTER_CHUNK_DELAY_MS: u64 = 4;
 const UPLOAD_IO_TIMEOUT_MS: u64 = 1200;
 const UPLOAD_WRITE_RETRY_COUNT: usize = 6;
 const UPLOAD_RETRY_SLEEP_MS: u64 = 8;
 const UPLOAD_ATTEMPT_RETRY_COUNT: usize = 2;
-const UPLOAD_OK_WAIT_TIMEOUT_SECS: u64 = 35;
+const UPLOAD_OK_WAIT_TIMEOUT_SECS: u64 = 210;
 const DRAIN_WINDOW_MS: u64 = 350;
 const DOWNLOAD_READY_WAIT_TIMEOUT_SECS: u64 = 10;
 const DOWNLOAD_READ_TIMEOUT_SECS: u64 = 45;
@@ -45,6 +47,11 @@ const LISTENER_HANDSHAKE_TIMEOUT_MS: u64 = 500;
 const COMPANION_SETTINGS_FILE: &str = "companion-settings.json";
 const COMPANION_MACROS_FILE: &str = "companion-macros.json";
 const RADIAL_DIRECTIONS: [&str; 4] = ["n", "e", "s", "w"];
+const SCREENSAVER_REMOTE_PATH: &str = "/screensavers/active.sdmj";
+const SDMJ_MAGIC: &[u8; 4] = b"SDMJ";
+const SDMJ_VERSION: u16 = 1;
+const SDMJ_HEADER_SIZE: u16 = 40;
+const SDMJ_INDEX_ENTRY_SIZE: usize = 8;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +93,38 @@ struct SendUpdatesRequest {
 #[serde(rename_all = "camelCase")]
 struct SendUpdatesResult {
     logs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ScreensaverUploadRequest {
+    port_name: String,
+    baud_rate: u32,
+    source_path: String,
+    ffmpeg_path: Option<String>,
+    width: u16,
+    height: u16,
+    fps: u16,
+    duration_seconds: f32,
+    quality: u8,
+    test_loops: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreensaverUploadResult {
+    logs: Vec<String>,
+    output_bytes: usize,
+    frame_count: usize,
+    max_frame_bytes: usize,
+    playback_line: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalFileInfo {
+    name: String,
+    bytes: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1264,6 +1303,19 @@ fn upload_file(
         ));
     }
 
+    if should_use_acked_upload(remote_path, data.len()) {
+        match upload_file_acked(port, remote_path, data, logs, progress) {
+            Ok(()) => return Ok(()),
+            Err(err) if can_fallback_to_streaming_put(&err) => {
+                logs.push(format!(
+                    "Falling back to streaming PUT for {remote_path} after PUTC failure: {err}"
+                ));
+                let _ = drain_pending_lines(port, logs);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
     for attempt in 0..=UPLOAD_ATTEMPT_RETRY_COUNT {
         if let Some(progress) = progress {
             progress.emit("uploading", 0);
@@ -1292,7 +1344,7 @@ fn upload_file(
         let previous_timeout = port.timeout();
         let _ = port.set_timeout(Duration::from_millis(UPLOAD_IO_TIMEOUT_MS));
 
-        let stream_result = stream_payload_chunked(port, data, logs, progress)
+        let stream_result = stream_payload_chunked(port, remote_path, data, logs, progress)
             .map_err(|e| format!("Failed to stream payload to {remote_path}: {e}"));
 
         let _ = port.set_timeout(previous_timeout);
@@ -1311,6 +1363,10 @@ fn upload_file(
         }
 
         let ok_prefix = format!("CDC:OK PUT {remote_path}");
+        if let Some(progress) = progress {
+            progress.emit("committing", data.len());
+        }
+        logs.push(format!("Waiting for device to commit {remote_path}"));
         match wait_for(
             port,
             Duration::from_secs(UPLOAD_OK_WAIT_TIMEOUT_SECS),
@@ -1319,7 +1375,7 @@ fn upload_file(
         ) {
             Ok(_) => {
                 if let Some(progress) = progress {
-                    progress.emit("uploading", data.len());
+                    progress.emit("complete", data.len());
                 }
                 return Ok(());
             }
@@ -1342,12 +1398,113 @@ fn upload_file(
     Err(format!("Upload retries exhausted for {remote_path}"))
 }
 
+fn should_use_acked_upload(remote_path: &str, byte_count: usize) -> bool {
+    !remote_path.starts_with("/screensavers/") && byte_count > 64 * 1024
+}
+
+fn can_fallback_to_streaming_put(error: &str) -> bool {
+    error.contains("CDC:ERR UNKNOWN_CMD") || error.contains("CDC:ERR PUTC_SYNTAX")
+}
+
+fn upload_file_acked(
+    port: &mut dyn SerialPort,
+    remote_path: &str,
+    data: &[u8],
+    logs: &mut Vec<String>,
+    progress: Option<&UploadProgressTracker<'_>>,
+) -> Result<(), String> {
+    if let Some(progress) = progress {
+        progress.emit("uploading", 0);
+    }
+
+    let put_cmd = format!("PUTC {remote_path} {}", data.len());
+    send_line(port, &put_cmd, logs)?;
+
+    let ready_prefix = format!("CDC:READY PUTC {remote_path}");
+    wait_for(port, Duration::from_secs(8), logs, |line| {
+        line.starts_with(&ready_prefix)
+    })?;
+
+    let previous_timeout = port.timeout();
+    let _ = port.set_timeout(Duration::from_millis(UPLOAD_IO_TIMEOUT_MS));
+
+    let result = stream_payload_acked(port, remote_path, data, logs, progress);
+
+    let _ = port.set_timeout(previous_timeout);
+    result
+}
+
+fn stream_payload_acked(
+    port: &mut dyn SerialPort,
+    remote_path: &str,
+    data: &[u8],
+    logs: &mut Vec<String>,
+    progress: Option<&UploadProgressTracker<'_>>,
+) -> Result<(), String> {
+    let total = data.len();
+    let mut sent = 0_usize;
+    let mut next_progress_mark = ACKED_UPLOAD_PROGRESS_STEP;
+
+    while sent < total {
+        let chunk_end = (sent + ACKED_UPLOAD_CHUNK_SIZE).min(total);
+        let chunk = &data[sent..chunk_end];
+        let chunk_len = chunk.len() as u16;
+
+        port.write_all(&chunk_len.to_le_bytes())
+            .map_err(|e| format!("Serial chunk header write failed: {e}"))?;
+        port.write_all(chunk)
+            .map_err(|e| format!("Serial chunk write failed: {e}"))?;
+        flush_serial_port(port)?;
+
+        let line = read_line_until(port, Instant::now() + Duration::from_secs(30))?;
+        if line.starts_with("CDC:ERR") {
+            return Err(format!("Device reported error: {line}"));
+        }
+
+        if chunk_end == total {
+            let ok_prefix = format!("CDC:OK PUTC {remote_path}");
+            logs.push(format!("< {line}"));
+            if !line.starts_with(&ok_prefix) {
+                return Err(format!("Expected PUTC OK, got: {line}"));
+            }
+        } else {
+            let acked = parse_putc_ack(&line)?;
+            if acked != chunk_end {
+                return Err(format!("PUTC ACK offset mismatch: {acked} != {chunk_end}"));
+            }
+        }
+
+        sent = chunk_end;
+        if sent >= next_progress_mark || sent == total {
+            logs.push(format!("acked payload progress: {sent}/{total}"));
+            if let Some(progress) = progress {
+                progress.emit("uploading", sent);
+            }
+            next_progress_mark += ACKED_UPLOAD_PROGRESS_STEP;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_putc_ack(line: &str) -> Result<usize, String> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() != 3 || parts[0] != "CDC:ACK" || parts[1] != "PUTC" {
+        return Err(format!("Expected PUTC ACK, got: {line}"));
+    }
+
+    parts[2]
+        .parse::<usize>()
+        .map_err(|e| format!("Invalid PUTC ACK offset '{}': {e}", parts[2]))
+}
+
 fn is_transient_write_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::TimedOut || error.raw_os_error() == Some(121)
 }
 
 fn stream_payload_chunked(
     port: &mut dyn SerialPort,
+    remote_path: &str,
     data: &[u8],
     logs: &mut Vec<String>,
     progress: Option<&UploadProgressTracker<'_>>,
@@ -1355,9 +1512,19 @@ fn stream_payload_chunked(
     let total = data.len();
     let mut sent = 0_usize;
     let mut next_progress_mark = 4096_usize;
+    let upload_chunk_size = if remote_path.starts_with("/screensavers/") {
+        64
+    } else {
+        UPLOAD_CHUNK_SIZE
+    };
+    let upload_inter_chunk_delay_ms = if remote_path.starts_with("/screensavers/") {
+        2
+    } else {
+        UPLOAD_INTER_CHUNK_DELAY_MS
+    };
 
     while sent < total {
-        let chunk_end = (sent + UPLOAD_CHUNK_SIZE).min(total);
+        let chunk_end = (sent + upload_chunk_size).min(total);
         let mut chunk_offset = sent;
 
         while chunk_offset < chunk_end {
@@ -1395,8 +1562,8 @@ fn stream_payload_chunked(
 
         sent = chunk_end;
         flush_serial_port(port)?;
-        if UPLOAD_INTER_CHUNK_DELAY_MS > 0 && sent < total {
-            thread::sleep(Duration::from_millis(UPLOAD_INTER_CHUNK_DELAY_MS));
+        if upload_inter_chunk_delay_ms > 0 && sent < total {
+            thread::sleep(Duration::from_millis(upload_inter_chunk_delay_ms));
         }
 
         if sent >= next_progress_mark || sent == total {
@@ -1552,6 +1719,367 @@ fn download_file(
     )?;
 
     Ok(Some(payload))
+}
+
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    crc = !crc;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn push_le_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_le_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn validate_screensaver_request(request: &ScreensaverUploadRequest) -> Result<(), String> {
+    if request.port_name.trim().is_empty() {
+        return Err("A serial port must be selected".to_string());
+    }
+
+    let source_path = Path::new(&request.source_path);
+    if request.source_path.trim().is_empty() || !source_path.exists() {
+        return Err("Choose a GIF or video file before uploading".to_string());
+    }
+
+    if request.width == 0
+        || request.height == 0
+        || request.width > 800
+        || request.height > 480
+        || 800 % request.width != 0
+        || 480 % request.height != 0
+    {
+        return Err("Screensaver size must divide the 800x480 display".to_string());
+    }
+
+    if request.fps == 0 || request.fps > 60 {
+        return Err("Screensaver fps must be 1..60".to_string());
+    }
+
+    if request.duration_seconds <= 0.0 || request.duration_seconds > 600.0 {
+        return Err("Screensaver duration must be between 0 and 600 seconds".to_string());
+    }
+
+    if request.quality < 2 || request.quality > 31 {
+        return Err("ffmpeg MJPEG quality must be 2..31".to_string());
+    }
+
+    Ok(())
+}
+
+fn unique_temp_dir(prefix: &str) -> Result<PathBuf, String> {
+    let mut dir = std::env::temp_dir();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("System clock error: {e}"))?
+        .as_millis();
+    dir.push(format!("{prefix}-{}-{stamp}", std::process::id()));
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create temp directory: {e}"))?;
+    Ok(dir)
+}
+
+fn collect_jpeg_frames(frames_dir: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let mut entries = fs::read_dir(frames_dir)
+        .map_err(|e| format!("Failed to read ffmpeg frame directory: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to inspect ffmpeg frame: {e}"))?;
+    entries.sort_by_key(|entry| entry.path());
+
+    let mut frames = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jpg") {
+            continue;
+        }
+
+        let data = fs::read(&path)
+            .map_err(|e| format!("Failed to read JPEG frame {}: {e}", path.display()))?;
+        let is_jpeg = data.len() >= 4
+            && data.starts_with(&[0xFF, 0xD8])
+            && data.ends_with(&[0xFF, 0xD9]);
+        if !is_jpeg {
+            return Err(format!("ffmpeg produced an invalid JPEG: {}", path.display()));
+        }
+        frames.push(data);
+    }
+
+    if frames.is_empty() {
+        return Err("ffmpeg produced no JPEG frames".to_string());
+    }
+
+    Ok(frames)
+}
+
+fn build_sdmj_bytes(
+    frames: &[Vec<u8>],
+    width: u16,
+    height: u16,
+    fps: u16,
+) -> Result<(Vec<u8>, usize), String> {
+    let index_bytes = frames
+        .len()
+        .checked_mul(SDMJ_INDEX_ENTRY_SIZE)
+        .ok_or_else(|| "Too many frames for SDMJ index".to_string())?;
+    let data_offset = usize::from(SDMJ_HEADER_SIZE) + index_bytes;
+    let payload_bytes = frames.iter().map(Vec::len).sum::<usize>();
+    let total_size = data_offset
+        .checked_add(payload_bytes)
+        .ok_or_else(|| "SDMJ file is too large".to_string())?;
+
+    if total_size > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "Converted screensaver is over the {} byte upload limit",
+            MAX_UPLOAD_BYTES
+        ));
+    }
+
+    let mut index = Vec::with_capacity(index_bytes);
+    let mut payload = Vec::with_capacity(payload_bytes);
+    let mut frame_offset = data_offset;
+    let mut max_frame = 0_usize;
+
+    for frame in frames {
+        push_le_u32(
+            &mut index,
+            u32::try_from(frame_offset).map_err(|_| "SDMJ offset overflow".to_string())?,
+        );
+        push_le_u32(
+            &mut index,
+            u32::try_from(frame.len()).map_err(|_| "SDMJ frame size overflow".to_string())?,
+        );
+        frame_offset += frame.len();
+        max_frame = max_frame.max(frame.len());
+        payload.extend_from_slice(frame);
+    }
+
+    let mut crc = 0_u32;
+    crc = crc32_update(crc, &index);
+    crc = crc32_update(crc, &payload);
+
+    let mut output = Vec::with_capacity(total_size);
+    output.extend_from_slice(SDMJ_MAGIC);
+    push_le_u16(&mut output, SDMJ_VERSION);
+    push_le_u16(&mut output, SDMJ_HEADER_SIZE);
+    push_le_u16(&mut output, width);
+    push_le_u16(&mut output, height);
+    push_le_u16(&mut output, fps);
+    push_le_u16(&mut output, 0);
+    push_le_u32(
+        &mut output,
+        u32::try_from(frames.len()).map_err(|_| "SDMJ frame count overflow".to_string())?,
+    );
+    push_le_u32(&mut output, u32::from(SDMJ_HEADER_SIZE));
+    push_le_u32(
+        &mut output,
+        u32::try_from(data_offset).map_err(|_| "SDMJ data offset overflow".to_string())?,
+    );
+    push_le_u32(
+        &mut output,
+        u32::try_from(total_size).map_err(|_| "SDMJ total size overflow".to_string())?,
+    );
+    push_le_u32(
+        &mut output,
+        u32::try_from(max_frame).map_err(|_| "SDMJ max frame overflow".to_string())?,
+    );
+    push_le_u32(&mut output, crc);
+    output.extend_from_slice(&index);
+    output.extend_from_slice(&payload);
+
+    Ok((output, max_frame))
+}
+
+fn convert_media_to_sdmj(
+    request: &ScreensaverUploadRequest,
+    logs: &mut Vec<String>,
+) -> Result<(Vec<u8>, usize, usize), String> {
+    validate_screensaver_request(request)?;
+
+    let temp_dir = unique_temp_dir("screendeck-sdmj")?;
+    let frames_dir = temp_dir.join("frames");
+    fs::create_dir_all(&frames_dir)
+        .map_err(|e| format!("Failed to create frame directory: {e}"))?;
+
+    let ffmpeg = request
+        .ffmpeg_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("ffmpeg");
+    let frame_pattern = frames_dir.join("frame_%05d.jpg");
+    let max_frames = ((request.duration_seconds * f32::from(request.fps)).floor() as u32).max(1);
+    let vf = format!(
+        "fps={},scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2:color=black,format=yuvj420p",
+        request.fps, request.width, request.height, request.width, request.height
+    );
+
+    logs.push(format!(
+        "Converting {} -> {}x{}@{} q{}",
+        request.source_path, request.width, request.height, request.fps, request.quality
+    ));
+
+    let output = Command::new(ffmpeg)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-t")
+        .arg(format!("{}", request.duration_seconds))
+        .arg("-i")
+        .arg(&request.source_path)
+        .arg("-an")
+        .arg("-vf")
+        .arg(vf)
+        .arg("-frames:v")
+        .arg(max_frames.to_string())
+        .arg("-q:v")
+        .arg(request.quality.to_string())
+        .arg(&frame_pattern)
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(format!("ffmpeg failed: {}", stderr.trim()));
+    }
+
+    let frames = collect_jpeg_frames(&frames_dir);
+    let _ = fs::remove_dir_all(&temp_dir);
+    let frames = frames?;
+    let frame_count = frames.len();
+    let (sdmj, max_frame) = build_sdmj_bytes(&frames, request.width, request.height, request.fps)?;
+    logs.push(format!(
+        "Built SDMJ: {} frame(s), {} bytes, max frame {} bytes",
+        frame_count,
+        sdmj.len(),
+        max_frame
+    ));
+
+    Ok((sdmj, frame_count, max_frame))
+}
+
+fn upload_screensaver_impl(
+    app_handle: AppHandle,
+    request: ScreensaverUploadRequest,
+) -> Result<ScreensaverUploadResult, String> {
+    let mut logs = Vec::new();
+    let _ = app_handle.emit_all(
+        UPLOAD_PROGRESS_EVENT,
+        UploadProgressEvent {
+            phase: "preparing".to_string(),
+            current_bytes: 0,
+            total_bytes: 0,
+            file_bytes_sent: 0,
+            file_total_bytes: 0,
+            file_path: "screensaver conversion".to_string(),
+            file_index: 0,
+            file_count: 1,
+        },
+    );
+
+    let (sdmj, frame_count, max_frame_bytes) = convert_media_to_sdmj(&request, &mut logs)
+        .map_err(|err| format!("{err}\n---LOGS---\n{}", logs.join("\n")))?;
+
+    logs.push(format!(
+        "Opening {} at {} baud",
+        request.port_name, request.baud_rate
+    ));
+    let mut port = match open_serial_port(&request.port_name, request.baud_rate) {
+        Ok(port) => port,
+        Err(err) => {
+            logs.push(format!("ERROR: {err}"));
+            return Err(format!("{err}\n---LOGS---\n{}", logs.join("\n")));
+        }
+    };
+
+    if let Err(err) = drain_pending_lines(port.as_mut(), &mut logs) {
+        logs.push(format!("Drain warning: {err}"));
+    }
+
+    if let Err(err) = handshake_with_fallback(port.as_mut(), &mut logs, HANDSHAKE_TOTAL_TIMEOUT_MS)
+    {
+        logs.push(format!("ERROR: {err}"));
+        return Err(format!("{err}\n---LOGS---\n{}", logs.join("\n")));
+    }
+
+    let progress = UploadProgressTracker {
+        app_handle: &app_handle,
+        total_bytes: sdmj.len(),
+        completed_bytes: 0,
+        file_total_bytes: sdmj.len(),
+        file_index: 1,
+        file_count: 1,
+        file_path: SCREENSAVER_REMOTE_PATH,
+    };
+    logs.push(format!(
+        "Uploading screensaver -> {}",
+        SCREENSAVER_REMOTE_PATH
+    ));
+    if let Err(err) = upload_file(
+        port.as_mut(),
+        SCREENSAVER_REMOTE_PATH,
+        &sdmj,
+        &mut logs,
+        Some(&progress),
+    ) {
+        logs.push(format!("ERROR: {err}"));
+        return Err(format!("{err}\n---LOGS---\n{}", logs.join("\n")));
+    }
+
+    send_line(port.as_mut(), "SS STATUS", &mut logs)
+        .map_err(|err| format!("{err}\n---LOGS---\n{}", logs.join("\n")))?;
+    wait_for(port.as_mut(), Duration::from_secs(6), &mut logs, |line| {
+        line.starts_with("CDC:SS STATUS")
+    })
+    .map_err(|err| format!("{err}\n---LOGS---\n{}", logs.join("\n")))?;
+
+    let mut playback_line = None;
+    if let Some(test_loops) = request.test_loops.filter(|loops| *loops > 0) {
+        let command = format!("SS PLAY {}", test_loops.min(20));
+        send_line(port.as_mut(), &command, &mut logs)
+            .map_err(|err| format!("{err}\n---LOGS---\n{}", logs.join("\n")))?;
+        let timeout = Duration::from_secs(
+            ((u64::from(test_loops.min(20)) * frame_count as u64) / u64::from(request.fps))
+                .saturating_add(30)
+                .max(45),
+        );
+        let line = wait_for(port.as_mut(), timeout, &mut logs, |line| {
+            line.starts_with("CDC:SS PLAY")
+        })
+        .map_err(|err| format!("{err}\n---LOGS---\n{}", logs.join("\n")))?;
+        playback_line = Some(line);
+    }
+
+    let _ = app_handle.emit_all(
+        UPLOAD_PROGRESS_EVENT,
+        UploadProgressEvent {
+            phase: "complete".to_string(),
+            current_bytes: sdmj.len(),
+            total_bytes: sdmj.len(),
+            file_bytes_sent: sdmj.len(),
+            file_total_bytes: sdmj.len(),
+            file_path: SCREENSAVER_REMOTE_PATH.to_string(),
+            file_index: 1,
+            file_count: 1,
+        },
+    );
+
+    logs.push("Screensaver upload complete".to_string());
+    Ok(ScreensaverUploadResult {
+        logs,
+        output_bytes: sdmj.len(),
+        frame_count,
+        max_frame_bytes,
+        playback_line,
+    })
 }
 
 fn send_updates_impl(
@@ -1762,6 +2290,43 @@ async fn send_updates(
     }
 
     Ok(result)
+}
+
+#[tauri::command]
+async fn upload_screensaver(
+    app_handle: AppHandle,
+    state: State<'_, CompanionState>,
+    request: ScreensaverUploadRequest,
+) -> Result<ScreensaverUploadResult, String> {
+    let companion = state.inner().clone();
+    let app_handle_for_task = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _pause = pause_companion_listener(&app_handle_for_task, &companion)?;
+        upload_screensaver_impl(app_handle_for_task, request)
+    })
+    .await
+    .map_err(|e| format!("Background task failed: {e}"))?
+}
+
+#[tauri::command]
+fn get_local_file_info(path: String) -> Result<LocalFileInfo, String> {
+    let path = PathBuf::from(path);
+    let metadata = fs::metadata(&path)
+        .map_err(|e| format!("Failed to read file metadata for {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("Selected path is not a file: {}", path.display()));
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Selected file")
+        .to_string();
+
+    Ok(LocalFileInfo {
+        name,
+        bytes: metadata.len(),
+    })
 }
 
 fn sync_from_device_impl(request: SyncFromDeviceRequest) -> Result<SyncFromDeviceResult, String> {
@@ -2052,6 +2617,8 @@ fn main() {
             cache_companion_macros,
             probe_serial_ports,
             send_updates,
+            upload_screensaver,
+            get_local_file_info,
             sync_from_device
         ])
         .run(tauri::generate_context!())

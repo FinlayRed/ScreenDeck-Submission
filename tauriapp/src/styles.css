@@ -156,6 +156,52 @@ textarea {
   color: var(--danger);
 }
 
+.screensaver-panel {
+  flex-basis: 100%;
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.screensaver-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.screensaver-header > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 0.12rem;
+}
+
+.screensaver-header strong {
+  font-size: 0.78rem;
+}
+
+.screensaver-header span {
+  color: var(--text-soft);
+  font-size: 0.72rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.screensaver-controls {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 1fr));
+  gap: 0.45rem;
+}
+
+.screensaver-controls label {
+  display: grid;
+  gap: 0.2rem;
+}
+
 .upload-progress-panel {
   flex-basis: 100%;
   display: grid;
@@ -855,5 +901,14 @@ hr {
 
   .control.small {
     min-width: 100%;
+  }
+
+  .screensaver-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .screensaver-controls {
+    grid-template-columns: repeat(2, minmax(90px, 1fr));
   }
 }
